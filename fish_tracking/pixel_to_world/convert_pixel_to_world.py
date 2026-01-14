@@ -5,7 +5,7 @@ import sys
 import copy
 import math
 
-from fish_tracking.common.kalman_filter import KalmanFilter
+from fish_tracking.common.kalman_filter import StaticKalmanFilter
 from fish_tracking.common.camera_utils.camera_handler import CameraHandler
 from fish_tracking.common.camera_utils.camera import Camera
 from fish_tracking.common.animation_smoother import AnimationSmoother
@@ -283,46 +283,36 @@ def getPose_GPS(sensor_df):
 
     return poseGPS
 
-def get_camera(drone_record_data, i, time_per_frame_ms, kf, current_camera, target_cam_pos, smoother, cam_pos, cam_q, reference_geo):
+def get_camera(drone_record_data, i, time_per_frame_ms, current_camera, target_cam_pos, smoother, cam_pos, cam_q, reference_geo):
+    """
+    Update camera pose from drone sensor data.
+
+    Note: This function no longer performs Kalman filtering. Camera positions are now
+    sourced from the forward KF + RTS smoother pipeline (Section 2-3). This function
+    only handles quaternion updates from gimbal sensors and animation smoothing.
+
+    Legacy behavior (removed): Previously contained a real-time Kalman filter that
+    matched the original C++ implementation, but was made redundant when the batch
+    processing pipeline was added.
+    """
     updated = drone_record_data.read_next_line(float(i) * time_per_frame_ms)
 
     if updated and len(drone_record_data.last_line) != 0:
         drone_record_data.update_drone_data()
 
         if i == 0:
-            reference_geo = np.array([drone_record_data.geo[0], drone_record_data.geo[1], 0])  # same as c++
+            reference_geo = np.array([drone_record_data.geo[0], drone_record_data.geo[1], 0])
 
-            # initialize positions
-            cam_q = get_quaternion_from_euler(drone_record_data.gimbal_euler)  # ok
-            cam_pos = geo_to_cartesian(drone_record_data.geo, reference_geo)  # ok
-
-            # initializing state vector for kalman filter
-            kf.state = np.array([cam_pos[0], cam_pos[1], cam_pos[2], 0.0, 0.0, 0.0])
+            # Initialize positions
+            cam_q = get_quaternion_from_euler(drone_record_data.gimbal_euler)
+            cam_pos = geo_to_cartesian(drone_record_data.geo, reference_geo)
 
             current_camera.compute_image_pose(copy.deepcopy(cam_q), copy.deepcopy(cam_pos))
 
-        # kalman pos update
-        time_diff = (drone_record_data.time_ms - drone_record_data.prev_time_ms) / 1000
-        new_coords = geo_to_cartesian(drone_record_data.geo, reference_geo)  # so far ok
-
-        new_values = np.zeros(KF_DOF)
-        new_values[0] = new_coords[0]
-        new_values[1] = new_coords[1]
-        new_values[2] = drone_record_data.geo[2]
-        new_values[3] = drone_record_data.vel[0]
-        new_values[4] = drone_record_data.vel[1]
-        new_values[5] = drone_record_data.vel[2]
-
-        kf.predict(time_diff)
-        kf.update(new_values)
-        target_cam_pos[0] = kf.state[0]
-        target_cam_pos[1] = kf.state[1]
-        target_cam_pos[2] = kf.state[2]
-
-
-    # quaternion update
+    # Quaternion update from gimbal sensors
     target_cam_q = get_quaternion_from_euler(drone_record_data.gimbal_euler)
-    # perform iteration step for animation smoothing
+
+    # Perform iteration step for animation smoothing
     cam_pos, cam_q = smoother.update_cam_pose_animation(cam_pos, target_cam_pos, cam_q, target_cam_q)
 
     return cam_pos, cam_q, reference_geo
@@ -387,53 +377,50 @@ def convert_pixel_to_world(
     estimated_velocities = []
     estimated_position_variances = []
     estimated_velocity_variances = []
-    position_bounds_3sigma = []
 
     # Extract GPS relative positions in meters (relative to first GPS position)
     drone_positions_gps = getPose_GPS(sensor_data_df)
 
     # TODO: Investigate optimal noise attribution for camera pose estimation.
-    # Current configuration uses constant noise matrices for reproducibility with
-    # reference outputs. Consider testing time-adaptive process noise (remove Q_override)
-    # and per-state measurement noise (remove R_override) for potentially improved accuracy.
-    # Key parameters to investigate:
-    #   - Process noise: Q = I (constant) vs Q(dt) with in_q/out_q scaling
-    #   - Measurement noise: R = 100*I (uniform) vs separate pos/alt/vel variances
-    # Note: Joseph form covariance update is used for numerical stability (negligible 
-    # difference vs standard form at ~1e-14 level)
+    # ORIGINAL C++ PARAMETERS (main.cpp:127, from master_thesis_project-main-HU):
+    #   - pos_variance = POS_VAR * 10 = 6.0      # GPS horizontal position noise
+    #   - alt_variance = Z_POS_VAR * 10 = 2.0    # GPS altitude noise
+    #   - vel_variance = VEL_VAR * 10 = 2.0      # IMU velocity noise
+    #   - out_q = OUTER_Q_FACTOR * 10 = 100.0    # Process noise outer factor
+    #   - in_q = INNER_Q_FACTOR = 0.5            # Process noise inner factor (time-adaptive)
+    #   - P_initial = INIT_STATE_VAR * I = 10 * I(6)  # Initial covariance
+    #   - R: Per-state variances (pos_variance for x,y; alt_variance for z; vel_variance for vx,vy,vz)
+    #   - Q: Time-adaptive Q(dt) using in_q and out_q scaling factors
+
+    # The noise matrices were changed to their current static forms during the port from C++ to python.
+    # The static noise matrices date back to Pia's ported implementation
+    # The redundant Kalman filter and dates back to the C++ implementation
     
     # Initialize Kalman filter with constant noise matrices (matching original implementation)
-    kf = KalmanFilter(KF_DOF, INIT_STATE_VAR)
-
     for k in range(1, len(frame_times)):
+        # Find the row in the sensor data whose timestamp is closest to the current frame time
         current_time = frame_times[k - 1]
         measurement_idx = np.argmin(np.abs(sensor_times - current_time))
         sensor_time_at_idx = sensor_times[measurement_idx]
-        outlier_time = (871043 - sensor_data_df['time(millisecond)'].iloc[0]) / 1000
 
         # On first iteration, initialize; otherwise predict
         if k == 1:
             # Initialize with first measurement (matching original updateNumber==1 behavior)
             first_measurement = np.concatenate((drone_positions_gps[measurement_idx], get_velocity_enu(sensor_data_df, measurement_idx)))
-            kf.init(
-                pos_variance=100,  # Dummy value (overridden by R_override)
-                alt_variance=100,  # Dummy value (overridden by R_override)
-                vel_variance=100,  # Dummy value (overridden by R_override)
-                in_q=1.0,          # Dummy value (overridden by Q_override)
-                out_q=1.0,         # Dummy value (overridden by Q_override)
+            kf = StaticKalmanFilter(
                 initial_state=first_measurement,
-                R_override=100 * np.eye(6),      # Constant measurement noise
-                Q_override=np.eye(6),             # Constant process noise
-                P_initial_override=np.eye(6)     # Initial covariance (not scaled by INIT_STATE_VAR)
+                R=100 * np.eye(6),      # Constant measurement noise
+                Q=np.eye(6),            # Constant process noise
+                P_initial=np.eye(6)     # Initial covariance
             )
             filtered_state = kf.state
             filtered_variance = kf.P
         else:
             # Predict step
             kf.predict(frame_dt)
-            
-            # Use measurement if sensor time is close to frame time and not an outlier
-            if np.abs(sensor_time_at_idx - current_time) < frame_dt and sensor_time_at_idx != outlier_time:
+
+            # Use measurement if sensor time is close to frame time
+            if np.abs(sensor_time_at_idx - current_time) < frame_dt:
                 # Get velocity directly from sensor data at the matched index
                 current_velocity = get_velocity_enu(sensor_data_df, measurement_idx)
 
@@ -450,7 +437,6 @@ def convert_pixel_to_world(
         estimated_velocities.append(filtered_state[3:6])
         estimated_position_variances.append(np.array([filtered_variance[0, 0], filtered_variance[1, 1], filtered_variance[2, 2]]))
         estimated_velocity_variances.append(np.array([filtered_variance[3, 3], filtered_variance[4, 4], filtered_variance[5, 5]]))
-        position_bounds_3sigma.append(3 * np.sqrt(filtered_variance[0][0]))
 
     # ============================================================
     # SECTION 3: RTS backward smoother for improved estimates
@@ -512,25 +498,6 @@ def convert_pixel_to_world(
     camera_handler = CameraHandler()
     camera_handler.init_reader(sensor_data_df)
 
-    # TODO: pose_kf is confirmed redundant - remove in future refactor.
-    # Evidence: Fixing major bugs (in_q: 100→0.5, out_q: 6→100, initial_state: scalar→vector)
-    # produced ZERO change in output, confirming:
-    #   1. Position output is overridden by smoothed_positions (line 540+)
-    #   2. camera_quaternion comes from gimbal sensors (line 324), not this filter
-    #   3. Animation smoother processes position and orientation independently (line 326)
-    # This filter performs ~1136 predict/update cycles that are completely unused.
-    
-    # Initialize Kalman filter for pose estimation
-    pose_kf = KalmanFilter(KF_DOF, INIT_STATE_VAR)
-    pose_kf.init(
-        pos_variance=POS_VAR * 10,        # 6.0 - GPS horizontal position noise
-        alt_variance=Z_POS_VAR * 10,      # 2.0 - GPS altitude noise  
-        vel_variance=VEL_VAR * 10,        # 2.0 - IMU velocity noise
-        in_q=INNER_Q_FACTOR,              # 0.5 - Inner process noise factor (was bug: OUTER_Q_FACTOR * 10)
-        out_q=OUTER_Q_FACTOR * 10,        # 100.0 - Outer process noise factor (was bug: KF_DOF)
-        initial_state=np.zeros(KF_DOF)    # Dummy vector (gets overwritten in get_camera() line 300)
-    )
-
     # Animation smoothing state
     pose_smoother = AnimationSmoother()
     camera_position = np.array([0.0, 0.0, 0.0])
@@ -547,7 +514,7 @@ def convert_pixel_to_world(
 
         # Update camera pose from drone data with smoothing
         _, camera_quaternion, reference_geo_coords = get_camera(
-            camera_handler, frame_idx, time_per_frame_ms, pose_kf, current_camera,
+            camera_handler, frame_idx, time_per_frame_ms, current_camera,
             target_camera_position, pose_smoother, camera_position, camera_quaternion, reference_geo_coords
         )
 

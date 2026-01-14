@@ -3,7 +3,7 @@ from .video_data import VideoData
 from .extract_frames import extract_frames
 from .globals import *
 from .animation_smoother import AnimationSmoother
-from .kalman_filter import KalmanFilter
+from .kalman_filter import BaseKalmanFilter, StaticKalmanFilter, AdaptiveKalmanFilter
 from .math_utils import *
 
 __all__ = [
@@ -11,5 +11,7 @@ __all__ = [
     'VideoData',
     'extract_frames',
     'AnimationSmoother',
-    'KalmanFilter',
+    'BaseKalmanFilter',
+    'StaticKalmanFilter',
+    'AdaptiveKalmanFilter',
 ]

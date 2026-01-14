@@ -1,117 +1,184 @@
 import numpy as np
 
-class KalmanFilter:
-    def __init__(self,KF_DOF,INIT_STATE_VAR):
-        self.state = np.zeros(KF_DOF)
-        self.DOF = KF_DOF
-        self.P = np.eye(KF_DOF) * INIT_STATE_VAR
-        self.F = np.eye(KF_DOF)
-        self.H = np.eye(KF_DOF)
-        self.R = np.eye(KF_DOF)
-        self.Q = np.zeros((KF_DOF, KF_DOF))
-        self.I = np.eye(KF_DOF)
-        self.out_q = 0.0
-        self.in_q = 0.0
+class BaseKalmanFilter:
+    """
+    Base class for Kalman filter implementations.
 
+    Provides common predict() and update() methods for all Kalman filter variants.
+    Subclasses must implement their own __init__() to configure noise matrices.
+    """
 
-    def init(self, pos_variance, alt_variance, vel_variance, in_q, out_q, initial_state, 
-             R_override=None, Q_override=None, P_initial_override=None):
+    def __init__(self, dof, initial_state):
         """
-        Initialize the Kalman filter.
-        
+        Initialize base Kalman filter structure.
+
         Args:
-            pos_variance: Measurement noise for x,y positions (used if R_override is None)
-            alt_variance: Measurement noise for z position (used if R_override is None)
-            vel_variance: Measurement noise for velocities (used if R_override is None)
-            in_q: Inner process noise factor (used if Q_override is None)
-            out_q: Outer process noise factor (used if Q_override is None)
+            dof: Degrees of freedom (state dimension)
             initial_state: Initial state vector
-            R_override: Optional custom measurement noise matrix. If provided, overrides 
-                       the computed R matrix from pos/alt/vel variances.
-            Q_override: Optional custom process noise matrix. If provided, overrides 
-                       the time-adaptive Q computation in predict().
-            P_initial_override: Optional custom initial covariance matrix. If provided, overrides
-                              the default P = INIT_STATE_VAR * I initialization.
         """
-        if pos_variance <= 0 or alt_variance <= 0 or vel_variance <= 0 or out_q <= 0 or in_q <= 0:
-            print("INVALID_INITIALIZATION_VALUES")
-            exit(-1)
+        self.DOF = dof
+        self.state = initial_state.copy()
 
-        # Configure measurement noise (R matrix)
-        if R_override is not None:
-            self.R = R_override.copy()
-        else:
-            # Standard configuration: different variances for different state types
-            for i in range(self.DOF):
-                if i < 2:
-                    self.R[i, i] = pos_variance
-                elif i == 2:
-                    self.R[i, i] = alt_variance
-                else:
-                    self.R[i, i] = vel_variance
+        # State transition and observation matrices (identity by default)
+        self.F = np.eye(dof)
+        self.H = np.eye(dof)
+        self.I = np.eye(dof)
 
-        self.in_q = in_q
-        self.out_q = out_q
-        
-        # Configure process noise (Q matrix)
-        if Q_override is not None:
-            self.Q = Q_override.copy()
-            self.Q_override_active = True
-        else:
-            self.Q_override_active = False
-
-        # Configure initial covariance (P matrix)
-        if P_initial_override is not None:
-            self.P = P_initial_override.copy()
-
-        self.state = initial_state
+        # Matrices to be set by subclasses: P, Q, R
+        self.P = None  # State covariance
+        self.Q = None  # Process noise covariance
+        self.R = None  # Measurement noise covariance
 
     def predict(self, dt):
-        # Set self.F according to time step
+        """
+        Kalman filter prediction step.
+
+        Args:
+            dt: Time step in seconds
+        """
+        # Update state transition matrix with time step
+        # Assumes state vector: [x, y, z, vx, vy, vz]
         self.F[0, 3] = dt
         self.F[1, 4] = dt
         self.F[2, 5] = dt
 
-        # Compute process noise Q (skip if Q_override was provided)
-        if not hasattr(self, 'Q_override_active') or not self.Q_override_active:
-            q2 = self.in_q**2
-            dt2 = dt * dt
-            dt3 = dt * dt2
-            dt4 = dt * dt3
+        # This method will be overridden by subclasses if they need custom Q computation
+        self._update_process_noise(dt)
 
-            self.Q.fill(0)
-            for i in range(self.DOF):
-                if i < 3:
-                    self.Q[i, i] = q2 * dt4
-                else:
-                    self.Q[i, i] = dt2
-
-            self.Q = self.Q * self.out_q
-        # else: use the constant Q matrix set during init
-        #print("Q:",self.Q)
-
-        # Apply prediction step
+        # Standard prediction equations
         self.state = np.dot(self.F, self.state)
-        # Update covariance matrix
         Ft = self.F.transpose()
         self.P = np.dot(np.dot(self.F, self.P), Ft) + self.Q
-        #print("P:",self.P)
 
+    def _update_process_noise(self, dt):
+        """
+        Update process noise matrix Q. Override in subclasses for custom behavior.
+
+        Args:
+            dt: Time step in seconds
+        """
+        pass  # Default: Q remains constant
 
     def update(self, z):
+        """
+        Kalman filter update (measurement) step.
+
+        Args:
+            z: Measurement vector
+        """
         Ht = self.H.transpose()
 
         PHt = np.dot(self.P, Ht)
         y = z - np.dot(self.H, self.state)
         S = np.dot(self.H, PHt) + self.R
 
-        # changed inverse to pinv because of singular matrix
+        # Compute Kalman gain
         K = np.dot(PHt, np.linalg.inv(S))
 
         # Update state vector
         self.state = self.state + np.dot(K, y)
-        
+
         # Update covariance matrix using Joseph form (numerically stable)
         IKH = self.I - np.dot(K, self.H)
         self.P = np.dot(np.dot(IKH, self.P), IKH.transpose()) + np.dot(np.dot(K, self.R), K.transpose())
-        #print("state after:",self.state)
+
+
+class StaticKalmanFilter(BaseKalmanFilter):
+    """
+    Kalman filter with constant noise matrices.
+
+    All noise matrices (R, Q, P) are fixed at initialization and do not change
+    during operation. This is the most common use case for well-tuned systems.
+    """
+
+    def __init__(self, initial_state, R, Q, P_initial):
+        """
+        Initialize Kalman filter with static noise matrices.
+
+        Args:
+            initial_state: Initial state vector (numpy array of shape [dof])
+            R: Measurement noise covariance matrix (numpy array of shape [dof, dof])
+            Q: Process noise covariance matrix (numpy array of shape [dof, dof])
+            P_initial: Initial state covariance matrix (numpy array of shape [dof, dof])
+        """
+        dof = len(initial_state)
+        super().__init__(dof, initial_state)
+
+        self.R = R.copy()
+        self.Q = Q.copy()
+        self.P = P_initial.copy()
+
+
+class AdaptiveKalmanFilter(BaseKalmanFilter):
+    """
+    Kalman filter with time-adaptive process noise.
+
+    The process noise matrix Q is computed dynamically at each prediction step
+    based on the time interval dt and scaling factors (in_q, out_q). This matches
+    the original C++ implementation behavior.
+    """
+
+    def __init__(self, initial_state, pos_variance, alt_variance, vel_variance,
+                 in_q, out_q, P_initial_variance):
+        """
+        Initialize Kalman filter with adaptive process noise.
+
+        Args:
+            initial_state: Initial state vector (numpy array of shape [dof])
+            pos_variance: Measurement noise for x,y positions
+            alt_variance: Measurement noise for z position
+            vel_variance: Measurement noise for velocities
+            in_q: Inner process noise factor (time-adaptive scaling)
+            out_q: Outer process noise factor (overall Q scaling)
+            P_initial_variance: Scalar variance for initial covariance (P = P_initial_variance * I)
+        """
+        dof = len(initial_state)
+        super().__init__(dof, initial_state)
+
+        # Validate parameters
+        if pos_variance <= 0 or alt_variance <= 0 or vel_variance <= 0 or out_q <= 0 or in_q <= 0:
+            raise ValueError("All variance and noise parameters must be positive")
+
+        # Configure measurement noise matrix R
+        self.R = np.eye(dof)
+        for i in range(dof):
+            if i < 2:
+                self.R[i, i] = pos_variance
+            elif i == 2:
+                self.R[i, i] = alt_variance
+            else:
+                self.R[i, i] = vel_variance
+
+        # Store noise factors for dynamic Q computation
+        self.in_q = in_q
+        self.out_q = out_q
+
+        # Initialize process noise matrix (will be recomputed in predict)
+        self.Q = np.zeros((dof, dof))
+
+        # Initialize state covariance
+        self.P = np.eye(dof) * P_initial_variance
+
+    def _update_process_noise(self, dt):
+        """
+        Compute time-adaptive process noise matrix Q.
+
+        The Q matrix is scaled by dt^2 and dt^4 terms to account for acceleration
+        uncertainty that accumulates over time.
+
+        Args:
+            dt: Time step in seconds
+        """
+        q2 = self.in_q ** 2
+        dt2 = dt * dt
+        dt3 = dt * dt2
+        dt4 = dt * dt3
+
+        self.Q.fill(0)
+        for i in range(self.DOF):
+            if i < 3:  # Position states
+                self.Q[i, i] = q2 * dt4
+            else:  # Velocity states
+                self.Q[i, i] = dt2
+
+        self.Q = self.Q * self.out_q
