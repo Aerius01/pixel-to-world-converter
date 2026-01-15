@@ -27,9 +27,21 @@ cs_pos = np.array([0.0,0.0,0.0])
 # current velocity for cam euler angles, used for animation smoothing
 cs_cam_angle = np.array([0.0,0.0,0.0])
 
-def extrinsic_matrix(roll_t, pitch_t, yaw_t, cam_pos):
-
-    r = Rot.from_euler('xyz', [np.deg2rad(roll_t), np.deg2rad(pitch_t), -np.deg2rad(yaw_t)])
+def compute_extrinsic_matrix(angles, cam_pos):
+    """
+    Compute the extrinsic matrix from gimbal angles and camera position.
+    
+    Args:
+        angles (array-like): Gimbal angles in degrees where:
+            - angles[0]: roll
+            - angles[1]: pitch
+            - angles[2]: yaw
+        cam_pos (array-like): Camera position [x, y, z] in meters
+    
+    Returns:
+        np.ndarray: 4x4 extrinsic matrix
+    """
+    r = Rot.from_euler('xyz', [np.deg2rad(angles[0]), np.deg2rad(angles[1]), -np.deg2rad(angles[2])])
     R = r.as_matrix()
     # center world coordinate system at initial drone pose
     trans = np.array([cam_pos[0], cam_pos[1], cam_pos[2]]).reshape(3, 1)
@@ -369,16 +381,24 @@ def convert_pixel_to_world(
     frame_dt = 1.0 / video_fps # Time between frames
     frame_times = [frame_dt * i for i in range(video_num_frames)]
     sensor_times = (sensor_data_df['time(millisecond)'].values - sensor_data_df['time(millisecond)'].iloc[0]) / 1000  # Convert to seconds
+    
+    # For each frame, find the sensor data row with the closest timestamp
+    frame_to_sensor_idx = np.array([
+        np.argmin(np.abs(sensor_times - frame_time)) 
+        for frame_time in frame_times
+    ])
 
     # ============================================================
     # SECTION 2: Forward Kalman filter for camera pose estimation
     # ============================================================
+    # The Kalman filter predicts future values based on all the values that came before them.
+    # That is why it's called a 'forward' pass.
     estimated_positions = []
     estimated_velocities = []
     estimated_position_variances = []
     estimated_velocity_variances = []
 
-    # Extract GPS relative positions in meters (relative to first GPS position)
+    # Extract GPS positions in meters relative to the first GPS position (origin)
     drone_positions_gps = getPose_GPS(sensor_data_df)
 
     # TODO: Investigate optimal noise attribution for camera pose estimation.
@@ -398,39 +418,36 @@ def convert_pixel_to_world(
     
     # Initialize Kalman filter with constant noise matrices (matching original implementation)
     for k in range(1, len(frame_times)):
-        # Find the row in the sensor data whose timestamp is closest to the current frame time
+        # Get the sensor data row index for this frame using pre-computed mapping
         current_time = frame_times[k - 1]
-        measurement_idx = np.argmin(np.abs(sensor_times - current_time))
-        sensor_time_at_idx = sensor_times[measurement_idx]
+        mapped_idx = frame_to_sensor_idx[k - 1]
 
         # On first iteration, initialize; otherwise predict
         if k == 1:
             # Initialize with first measurement (matching original updateNumber==1 behavior)
-            first_measurement = np.concatenate((drone_positions_gps[measurement_idx], get_velocity_enu(sensor_data_df, measurement_idx)))
+            first_measurement = np.concatenate((drone_positions_gps[mapped_idx], get_velocity_enu(sensor_data_df, mapped_idx)))
             kf = StaticKalmanFilter(
                 initial_state=first_measurement,
                 R=100 * np.eye(6),      # Constant measurement noise
                 Q=np.eye(6),            # Constant process noise
                 P_initial=np.eye(6)     # Initial covariance
             )
-            filtered_state = kf.state
-            filtered_variance = kf.P
         else:
             # Predict step
             kf.predict(frame_dt)
 
             # Use measurement if sensor time is close to frame time
-            if np.abs(sensor_time_at_idx - current_time) < frame_dt:
+            if np.abs(sensor_times[mapped_idx] - current_time) < frame_dt:
                 # Get velocity directly from sensor data at the matched index
-                current_velocity = get_velocity_enu(sensor_data_df, measurement_idx)
+                current_velocity = get_velocity_enu(sensor_data_df, mapped_idx)
 
                 # Combine position and velocity measurements
-                measurement = np.concatenate((drone_positions_gps[measurement_idx], current_velocity))
+                measurement = np.concatenate((drone_positions_gps[mapped_idx], current_velocity))
                 kf.update(measurement)
-            
-            # Extract state and covariance after update (or prediction-only)
-            filtered_state = kf.state
-            filtered_variance = kf.P
+        
+        # Extract state and covariance after initialization/update
+        filtered_state = kf.state
+        filtered_variance = kf.P
 
         # Store filtered estimates
         estimated_positions.append(filtered_state[0:3])
@@ -441,39 +458,59 @@ def convert_pixel_to_world(
     # ============================================================
     # SECTION 3: RTS backward smoother for improved estimates
     # ============================================================
+    # The RTS smoother operates on a data set already smoothed by the Kalman filter
+    # and refines the estimates by making a backward pass through it. Passively, 
+    # it leverages the full dataset since it's operating on calculated values that 
+    # have already considered all the values that came before them (and therefore 
+    # incorporates 'future knowledge')
     smoothed_positions = []
-    smoothed_position_variances = []
 
     # Initialize RTS smoother
     smoother = RTSSmoother(frame_dt, dof=KF_DOF)
 
+    # Each iteration of the loop updates the internal state of the smoother before
+    # being passed into the next iteration, resulting in a sequential dependency chain
     for k in range(len(frame_times) - 1, 0, -1):
         state_kf = np.concatenate((estimated_positions[k - 1], estimated_velocities[k - 1]))
         variance_kf = np.eye(6) * np.concatenate((estimated_position_variances[k - 1], estimated_velocity_variances[k - 1]))
-        smoothed_state, smoothed_variance = smoother.update(state_kf, variance_kf)
+        smoothed_state, _ = smoother.update(state_kf, variance_kf)
 
         smoothed_positions.append(smoothed_state[0:3])
-        smoothed_position_variances.append(np.array([smoothed_variance[0, 0], smoothed_variance[1, 1], smoothed_variance[2, 2]]))
+
+    # Reconstruct full sequence: prepend frame 0 from forward KF and reverse to forward chronological order
+    full_smoothed_positions = [estimated_positions[0]] + smoothed_positions[::-1]
+
+    # Verify: full_smoothed_positions now has length video_num_frames
+    assert len(full_smoothed_positions) == len(frame_times), \
+        f"Expected {len(frame_times)} positions, got {len(full_smoothed_positions)}"
 
     # ============================================================
     # SECTION 4: Compute camera extrinsic matrices
     # ============================================================
-    camera_extrinsics = []
-    gimbal_yaw_values = sensor_data_df['gimbalYawRaw'].values
+    # Pre-allocate numpy array for extrinsic matrices (each is 4x4)
+    camera_extrinsics = np.zeros((video_num_frames, 4, 4))
 
-    for i in range(video_num_frames - 1):
-        # Find sensor measurement closest to current frame time
-        measurement_idx = np.argmin(np.abs(sensor_times - frame_times[i - 1]))
-        yaw_angle = gimbal_yaw_values[measurement_idx] / CONVERSION_FACTOR
-        pitch_angle = 0
-        roll_angle = 0
+    # It's more efficient to extract the 1D numpy arrays once and then index into them
+    # rather than calling the dataframe accessor functions repeatedly in the loop.
+    gimbal_yaw_values = sensor_data_df['gimbalYawRaw'].values
+    gimbal_pitch_values = sensor_data_df['gimbalPitchRaw'].values
+    gimbal_roll_values = sensor_data_df['gimbalRollRaw'].values
+
+    for i in range(video_num_frames):
+        mapped_idx = frame_to_sensor_idx[i]
+        
+        # Get gimbal angles as a vector [roll, pitch, yaw]
+        camera_angles = np.array([
+            gimbal_roll_values[mapped_idx],
+            gimbal_pitch_values[mapped_idx],
+            gimbal_yaw_values[mapped_idx]
+        ]) / CONVERSION_FACTOR
 
         # Get camera position from smoothed estimates
-        camera_position = copy.deepcopy(smoothed_positions[video_num_frames - i - 2])
+        camera_position = full_smoothed_positions[i]
 
         # Compute extrinsic matrix (rotation + translation)
-        extrinsic_matrix_current = extrinsic_matrix(roll_angle, pitch_angle, yaw_angle, camera_position)
-        camera_extrinsics.append(copy.deepcopy(extrinsic_matrix_current))
+        camera_extrinsics[i] = compute_extrinsic_matrix(camera_angles, camera_position)
 
     # ============================================================
     # SECTION 5: Compute camera poses with animation smoothing
@@ -508,7 +545,7 @@ def convert_pixel_to_world(
     # Storage for all camera poses
     all_camera_objects = []
 
-    for frame_idx in range(video_num_frames - 1):
+    for frame_idx in range(video_num_frames):
         if progress_callback:
             progress_callback(frame_idx)
 
@@ -519,11 +556,11 @@ def convert_pixel_to_world(
         )
 
         # Get smoothed position and apply coordinate transformation
-        camera_position = copy.deepcopy(smoothed_positions[video_num_frames - frame_idx - 2])
+        camera_position = copy.deepcopy(full_smoothed_positions[frame_idx])
         camera_position[0], camera_position[1] = camera_position[1], -camera_position[0]  # Swap and negate
 
         # Update camera object with current pose
-        current_camera.compute_image_pose(copy.deepcopy(camera_quaternion), copy.deepcopy(camera_position))
+        current_camera.compute_image_pose(camera_quaternion, camera_position)
         all_camera_objects.append(copy.deepcopy(current_camera))
 
     # ============================================================

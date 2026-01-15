@@ -33,24 +33,15 @@ class RTSSmoother:
         self.x = None
         self.P = None
         
-        # State transition matrix (constant velocity model for 6-DOF)
-        # Can be extended for other DOF configurations
-        if dof == 6:
-            self.A = np.array([
-                [1, 0, 0, dt, 0, 0],
-                [0, 1, 0, 0, dt, 0],
-                [0, 0, 1, 0, 0, dt],
-                [0, 0, 0, 1, 0, 0],
-                [0, 0, 0, 0, 1, 0],
-                [0, 0, 0, 0, 0, 1]
-            ])
-        else:
-            # Generic identity matrix for other DOF values
-            self.A = np.eye(dof)
-            # Add velocity integration for position states if dof allows
-            if dof >= 6:
-                for i in range(min(3, dof // 2)):
-                    self.A[i, i + dof // 2] = dt
+        # State transition matrix (constant velocity model)
+        # Identity matrix with velocity integration for position states
+        self.A = np.eye(dof)
+        
+        # Add velocity integration for position states if dof allows
+        # Assumes first half of states are positions, second half are velocities
+        if dof >= 6:
+            for i in range(min(3, dof // 2)):
+                self.A[i, i + dof // 2] = dt
         
         # Process noise covariance matrix
         self.Q = np.eye(dof)
