@@ -214,6 +214,16 @@ Notes:
 
         sensor_data_df = pd.read_csv(args.drone_log, usecols=SENSOR_COLUMNS, dtype=float)
         print(f"  Loaded {len(sensor_data_df)} sensor records")
+        
+        # Defensive programming: verify all velocity measurements are present
+        velocity_columns = ['velocityX(mps)', 'velocityY(mps)', 'velocityZ(mps)']
+        for col in velocity_columns:
+            if sensor_data_df[col].isna().any():
+                missing_count = sensor_data_df[col].isna().sum()
+                print(f"\n❌ Error: Drone log contains {missing_count} missing values in {col}.", file=sys.stderr)
+                print(f"   All velocity measurements are required for GPS conversion.", file=sys.stderr)
+                sys.exit(1)
+                
     except Exception as e:
         print(f"\n❌ Failed to load input files: {e}", file=sys.stderr)
         sys.exit(1)

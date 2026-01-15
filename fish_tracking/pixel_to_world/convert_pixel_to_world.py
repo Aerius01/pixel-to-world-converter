@@ -374,6 +374,10 @@ def convert_pixel_to_world(
         pd.DataFrame: World trajectory data with GPS coordinates
     """
 
+    # This function assumes that:
+    # - The sensor data is pre-filtered for the specific video
+    # - Each row of the sensor data contains all velocity measurements
+
     # ============================================================
     # SECTION 1: Process drone sensor data
     # ============================================================
@@ -393,10 +397,11 @@ def convert_pixel_to_world(
     # ============================================================
     # The Kalman filter predicts future values based on all the values that came before them.
     # That is why it's called a 'forward' pass.
-    estimated_positions = []
-    estimated_velocities = []
-    estimated_position_variances = []
-    estimated_velocity_variances = []
+    # Pre-allocate numpy arrays for Kalman filter estimates (one per frame)
+    kalman_estimated_positions = np.zeros((len(frame_times), 3))
+    kalman_estimated_velocities = np.zeros((len(frame_times), 3))
+    kalman_estimated_position_variances = np.zeros((len(frame_times), 3))
+    kalman_estimated_velocity_variances = np.zeros((len(frame_times), 3))
 
     # Extract GPS positions in meters relative to the first GPS position (origin)
     drone_positions_gps = getPose_GPS(sensor_data_df)
@@ -417,13 +422,13 @@ def convert_pixel_to_world(
     # The redundant Kalman filter and dates back to the C++ implementation
     
     # Initialize Kalman filter with constant noise matrices (matching original implementation)
-    for k in range(1, len(frame_times)):
+    for k in range(len(frame_times)):
         # Get the sensor data row index for this frame using pre-computed mapping
-        current_time = frame_times[k - 1]
-        mapped_idx = frame_to_sensor_idx[k - 1]
+        current_time = frame_times[k]
+        mapped_idx = frame_to_sensor_idx[k]
 
         # On first iteration, initialize; otherwise predict
-        if k == 1:
+        if k == 0:
             # Initialize with first measurement (matching original updateNumber==1 behavior)
             first_measurement = np.concatenate((drone_positions_gps[mapped_idx], get_velocity_enu(sensor_data_df, mapped_idx)))
             kf = StaticKalmanFilter(
@@ -450,10 +455,10 @@ def convert_pixel_to_world(
         filtered_variance = kf.P
 
         # Store filtered estimates
-        estimated_positions.append(filtered_state[0:3])
-        estimated_velocities.append(filtered_state[3:6])
-        estimated_position_variances.append(np.array([filtered_variance[0, 0], filtered_variance[1, 1], filtered_variance[2, 2]]))
-        estimated_velocity_variances.append(np.array([filtered_variance[3, 3], filtered_variance[4, 4], filtered_variance[5, 5]]))
+        kalman_estimated_positions[k] = filtered_state[0:3]
+        kalman_estimated_velocities[k] = filtered_state[3:6]
+        kalman_estimated_position_variances[k] = [filtered_variance[0, 0], filtered_variance[1, 1], filtered_variance[2, 2]]
+        kalman_estimated_velocity_variances[k] = [filtered_variance[3, 3], filtered_variance[4, 4], filtered_variance[5, 5]]
 
     # ============================================================
     # SECTION 3: RTS backward smoother for improved estimates
@@ -463,26 +468,26 @@ def convert_pixel_to_world(
     # it leverages the full dataset since it's operating on calculated values that 
     # have already considered all the values that came before them (and therefore 
     # incorporates 'future knowledge')
-    smoothed_positions = []
+    rts_smoothed_positions = []
 
     # Initialize RTS smoother
     smoother = RTSSmoother(frame_dt, dof=KF_DOF)
 
     # Each iteration of the loop updates the internal state of the smoother before
     # being passed into the next iteration, resulting in a sequential dependency chain
-    for k in range(len(frame_times) - 1, 0, -1):
-        state_kf = np.concatenate((estimated_positions[k - 1], estimated_velocities[k - 1]))
-        variance_kf = np.eye(6) * np.concatenate((estimated_position_variances[k - 1], estimated_velocity_variances[k - 1]))
-        smoothed_state, _ = smoother.update(state_kf, variance_kf)
+    for k in range(len(frame_times) - 1, -1, -1):
+        state_kf = np.concatenate((kalman_estimated_positions[k], kalman_estimated_velocities[k]))
+        variance_kf = np.eye(6) * np.concatenate((kalman_estimated_position_variances[k], kalman_estimated_velocity_variances[k]))
+        rts_smoothed_state, _ = smoother.update(state_kf, variance_kf)
 
-        smoothed_positions.append(smoothed_state[0:3])
+        rts_smoothed_positions.append(rts_smoothed_state[0:3])
 
-    # Reconstruct full sequence: prepend frame 0 from forward KF and reverse to forward chronological order
-    full_smoothed_positions = [estimated_positions[0]] + smoothed_positions[::-1]
+    # Reverse to forward chronological order
+    rts_smoothed_positions.reverse()
 
-    # Verify: full_smoothed_positions now has length video_num_frames
-    assert len(full_smoothed_positions) == len(frame_times), \
-        f"Expected {len(frame_times)} positions, got {len(full_smoothed_positions)}"
+    # Verify: rts_smoothed_positions now has length video_num_frames
+    assert len(rts_smoothed_positions) == len(frame_times), \
+        f"Expected {len(frame_times)} positions, got {len(rts_smoothed_positions)}"
 
     # ============================================================
     # SECTION 4: Compute camera extrinsic matrices
@@ -506,8 +511,8 @@ def convert_pixel_to_world(
             gimbal_yaw_values[mapped_idx]
         ]) / CONVERSION_FACTOR
 
-        # Get camera position from smoothed estimates
-        camera_position = full_smoothed_positions[i]
+        # Get camera position from RTS smoothed estimates
+        camera_position = rts_smoothed_positions[i]
 
         # Compute extrinsic matrix (rotation + translation)
         camera_extrinsics[i] = compute_extrinsic_matrix(camera_angles, camera_position)
@@ -555,8 +560,8 @@ def convert_pixel_to_world(
             target_camera_position, pose_smoother, camera_position, camera_quaternion, reference_geo_coords
         )
 
-        # Get smoothed position and apply coordinate transformation
-        camera_position = copy.deepcopy(full_smoothed_positions[frame_idx])
+        # Get RTS smoothed position and apply coordinate transformation
+        camera_position = copy.deepcopy(rts_smoothed_positions[frame_idx])
         camera_position[0], camera_position[1] = camera_position[1], -camera_position[0]  # Swap and negate
 
         # Update camera object with current pose
