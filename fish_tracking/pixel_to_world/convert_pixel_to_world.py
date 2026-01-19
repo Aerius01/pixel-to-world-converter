@@ -6,26 +6,13 @@ import copy
 import math
 
 from fish_tracking.common.kalman_filter import StaticKalmanFilter
-from fish_tracking.common.camera_utils.camera_handler import CameraHandler
-from fish_tracking.common.camera_utils.camera import Camera
-from fish_tracking.common.animation_smoother import AnimationSmoother
 from fish_tracking.common.globals import *
-from fish_tracking.pixel_tracking.tracker import Particle
 from fish_tracking.pixel_to_world.compute_statistics import *
 from fish_tracking.pixel_to_world.buffer import ATDBuffer
 from fish_tracking.pixel_to_world.rts_smoother import RTSSmoother
 
-import cv2
-import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as Rot
 import pymap3d as pm
-from fish_tracking.common.video_data import VideoData
-from fish_tracking.common.path_manager import PathManager
-# current velocity for position, used for animation smoothing
-cs_pos = np.array([0.0,0.0,0.0])
-
-# current velocity for cam euler angles, used for animation smoothing
-cs_cam_angle = np.array([0.0,0.0,0.0])
 
 def compute_extrinsic_matrix(angles, cam_pos):
     """
@@ -141,19 +128,46 @@ def rotation_matrix_ned(yaw, pitch, roll):
     return R
 
 def compute_intrinsic_matrix(focal_length, pixel_size, image_width, image_height):
-    # Calculate the focal lengths in pixels
-    f_x = focal_length / pixel_size[0]
-    f_y = focal_length / pixel_size[1]
+    """
+    Compute the camera intrinsic matrix that maps 3D camera coordinates to 2D pixel coordinates.
 
-    # Assume the principal point is at the center of the image
-    c_x = image_width / 2
-    c_y = image_height / 2
+    The intrinsic matrix encodes the camera's internal optical properties (lens and sensor),
+    independent of where the camera is positioned or pointing in the world.
 
-    # Construct the intrinsic matrix
+    Args:
+        focal_length (float): Physical focal length of the lens in meters
+        pixel_size (tuple): Physical size of one pixel (width, height) in meters
+        image_width (int): Image width in pixels
+        image_height (int): Image height in pixels
+
+    Returns:
+        np.ndarray: 3x3 intrinsic matrix K with structure:
+            [[f_x,   0, c_x],
+             [  0, f_y, c_y],
+             [  0,   0,   1]]
+
+            where:
+            - f_x, f_y: focal lengths in pixel units (controls zoom/magnification)
+            - c_x, c_y: principal point (where optical axis hits image plane)
+            - zeros: no skew between pixel axes (pixels are rectangular)
+            - 1: homogeneous coordinate for projection math
+    """
+    # Convert focal length from physical units (meters) to pixel units
+    # This tells us how many pixels correspond to the camera's focal length
+    f_x = focal_length / pixel_size[0]  # Horizontal focal length in pixels
+    f_y = focal_length / pixel_size[1]  # Vertical focal length in pixels
+
+    # The principal point is where the camera's optical axis intersects the image plane.
+    # For most cameras, this is very close to the image center.
+    c_x = image_width / 2   # Horizontal center
+    c_y = image_height / 2  # Vertical center
+
+    # Construct the 3x3 intrinsic matrix K
+    # This matrix is used in the pinhole camera model to project 3D points to 2D pixels
     K = np.array([
-        [f_x, 0, c_x],
-        [0, f_y, c_y],
-        [0, 0, 1]
+        [f_x, 0, c_x],  # Row 1: x-axis scaling and offset
+        [0, f_y, c_y],  # Row 2: y-axis scaling and offset
+        [0, 0, 1]       # Row 3: homogeneous coordinates
     ])
 
     return K
@@ -295,56 +309,23 @@ def getPose_GPS(sensor_df):
 
     return poseGPS
 
-def get_camera(drone_record_data, i, time_per_frame_ms, current_camera, target_cam_pos, smoother, cam_pos, cam_q, reference_geo):
+def prepare_pixel_tracks(target_df: pd.DataFrame):
+    """Prepare pixel track data for world coordinate conversion.
+
+    Args:
+        target_df: DataFrame already filtered to a single target_id with columns: id, x, y, frame, label
+
+    Returns:
+        tracks_df: DataFrame with columns x, y, frame (one row per detection)
     """
-    Update camera pose from drone sensor data.
+    # Return DataFrame with only the columns needed for tracking
+    # Round x, y to integers to match original Particle class behavior
+    tracks_df = target_df[['x', 'y', 'frame']].copy()
+    tracks_df['x'] = tracks_df['x'].round().astype(int)
+    tracks_df['y'] = tracks_df['y'].round().astype(int)
+    tracks_df['frame'] = tracks_df['frame'].astype(int)
 
-    Note: This function no longer performs Kalman filtering. Camera positions are now
-    sourced from the forward KF + RTS smoother pipeline (Section 2-3). This function
-    only handles quaternion updates from gimbal sensors and animation smoothing.
-
-    Legacy behavior (removed): Previously contained a real-time Kalman filter that
-    matched the original C++ implementation, but was made redundant when the batch
-    processing pipeline was added.
-    """
-    updated = drone_record_data.read_next_line(float(i) * time_per_frame_ms)
-
-    if updated and len(drone_record_data.last_line) != 0:
-        drone_record_data.update_drone_data()
-
-        if i == 0:
-            reference_geo = np.array([drone_record_data.geo[0], drone_record_data.geo[1], 0])
-
-            # Initialize positions
-            cam_q = get_quaternion_from_euler(drone_record_data.gimbal_euler)
-            cam_pos = geo_to_cartesian(drone_record_data.geo, reference_geo)
-
-            current_camera.compute_image_pose(copy.deepcopy(cam_q), copy.deepcopy(cam_pos))
-
-    # Quaternion update from gimbal sensors
-    target_cam_q = get_quaternion_from_euler(drone_record_data.gimbal_euler)
-
-    # Perform iteration step for animation smoothing
-    cam_pos, cam_q = smoother.update_cam_pose_animation(cam_pos, target_cam_pos, cam_q, target_cam_q)
-
-    return cam_pos, cam_q, reference_geo
-
-def get_img_tracks(statistics_data_handler, target_id):
-    particles = []
-    target_id = target_id #Baitball
-    species_label = None
-
-    for line in statistics_data_handler:
-
-        if int(line["id"]) == target_id:
-            x_pos = int(round(float(line["x"])))
-            y_pos = int(round(float(line["y"])))
-            particles.append([Particle(x_pos, y_pos, 1, int(line["frame"]))])
-            # Get the species label (should be the same for all entries of this target_id)
-            if species_label is None:
-                species_label = line.get("label", "Unknown")
-
-    return particles, species_label
+    return tracks_df
 
 def convert_pixel_to_world(
     image_tracks_df: pd.DataFrame,
@@ -503,8 +484,8 @@ def convert_pixel_to_world(
 
     for i in range(video_num_frames):
         mapped_idx = frame_to_sensor_idx[i]
-        
-        # Get gimbal angles as a vector [roll, pitch, yaw]
+
+        # Get gimbal angles as a vector [roll, pitch, yaw] in degrees
         camera_angles = np.array([
             gimbal_roll_values[mapped_idx],
             gimbal_pitch_values[mapped_idx],
@@ -518,59 +499,14 @@ def convert_pixel_to_world(
         camera_extrinsics[i] = compute_extrinsic_matrix(camera_angles, camera_position)
 
     # ============================================================
-    # SECTION 5: Compute camera poses with animation smoothing
+    # SECTION 5: Convert pixel tracks to world coordinates
     # ============================================================
     time_per_frame_ms = 1000.0 / video_fps
 
-    # Compute image plane dimensions from focal length and field of view
-    # These represent the physical dimensions of the image plane in the pinhole camera model.
-    # The image plane is where the 3D world projects onto an inverted 2D surface at distance FOCAL_LENGTH
-    # from the camera center, behind the aperture (within the camera). We use half-angle trigonometry
-    # because the half-angle produces a right triangle: tan(θ/2) = (width/2) / focal_length
-    image_plane_width = 2 * FOCAL_LENGTH * math.tan(OPENING_ANGLE_X / 2.0)
-    image_plane_height = image_plane_width * (video_height / video_width)
-    opening_angle_y = OPENING_ANGLE_X * image_plane_height / image_plane_width
+    # Use first GPS position as reference point (origin)
+    # Reference altitude at sea level == 0
+    gps_reference = [sensor_data_df.iloc[0]['latitude'], sensor_data_df.iloc[0]['longitude'], 0]
 
-    # Initialize camera object for pose tracking
-    current_camera = Camera()
-    current_camera.init(FOCAL_LENGTH, image_plane_width, image_plane_height, video_width, video_height,
-                        OPENING_ANGLE_X, opening_angle_y)
-
-    # Initialize camera handler for real-time pose updates with DataFrame
-    camera_handler = CameraHandler()
-    camera_handler.init_reader(sensor_data_df)
-
-    # Animation smoothing state
-    pose_smoother = AnimationSmoother()
-    camera_position = np.array([0.0, 0.0, 0.0])
-    camera_quaternion = np.array([0.0, 0.0, 0.0, 0.0])
-    target_camera_position = np.array([0.0, 0.0, 0.0])
-    reference_geo_coords = np.array([0, 0, 0])
-
-    # Storage for all camera poses
-    all_camera_objects = []
-
-    for frame_idx in range(video_num_frames):
-        if progress_callback:
-            progress_callback(frame_idx)
-
-        # Update camera pose from drone data with smoothing
-        _, camera_quaternion, reference_geo_coords = get_camera(
-            camera_handler, frame_idx, time_per_frame_ms, current_camera,
-            target_camera_position, pose_smoother, camera_position, camera_quaternion, reference_geo_coords
-        )
-
-        # Get RTS smoothed position and apply coordinate transformation
-        camera_position = copy.deepcopy(rts_smoothed_positions[frame_idx])
-        camera_position[0], camera_position[1] = camera_position[1], -camera_position[0]  # Swap and negate
-
-        # Update camera object with current pose
-        current_camera.compute_image_pose(camera_quaternion, camera_position)
-        all_camera_objects.append(copy.deepcopy(current_camera))
-
-    # ============================================================
-    # SECTION 6: Convert pixel tracks to world coordinates
-    # ============================================================
     # Compute camera intrinsic matrix for pixel-to-world projection
     pixel_size = (SENSOR_WIDTH/video_width, SENSOR_WIDTH/video_width)
     camera_intrinsic = compute_intrinsic_matrix(FOCAL_LENGTH, pixel_size, video_width, video_height)
@@ -583,17 +519,19 @@ def convert_pixel_to_world(
     # Collect trajectory DataFrames for each target
     trajectory_dfs = []
 
-    # Use first GPS position as reference point (origin)
-    # Reference altitude at sea level == 0
-    gps_reference = [sensor_data_df.iloc[0]['latitude'], sensor_data_df.iloc[0]['longitude'], 0]
-
     # Process each tracked target
     for target_id in image_tracks_df['id'].unique():
-        # Filter DataFrame for current target and convert to dict iterator
+        # Filter DataFrame for current target
         target_rows = image_tracks_df[image_tracks_df['id'] == target_id]
-        # Convert to list of dicts to match get_img_tracks interface
-        target_dicts = target_rows.to_dict('records')
-        pixel_tracks, species_label = get_img_tracks(target_dicts, target_id)
+
+        # Extract species label using majority voting (handles NaN labels)
+        species_label = "Unknown"
+        if 'label' in target_rows.columns and len(target_rows) > 0:
+            mode_result = target_rows['label'].mode()
+            species_label = mode_result.iloc[0] if len(mode_result) > 0 else "Unknown"
+
+        # Prepare pixel tracks (round coordinates to integers)
+        pixel_tracks = prepare_pixel_tracks(target_rows)
 
         # Convert to world coordinates and get trajectory DataFrame
         target_trajectory_df = compute_statistics(

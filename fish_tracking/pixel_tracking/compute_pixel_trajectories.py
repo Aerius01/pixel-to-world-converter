@@ -97,9 +97,15 @@ def compute_particles(path_manager: PathManager, video_data: VideoData):
     cam_q = get_quaternion_from_euler(drone_record_data.gimbal_euler)
     cam_pos = geo_to_cartesian(drone_record_data.geo, reference_geo)
 
-    current_camera = Camera()
-    current_camera.init(FOCAL_LENGTH, image_width, image_height, video_data.width, video_data.height,
-                        OPENING_ANGLE_X, opening_angle_y)
+    current_camera = Camera(
+        focal_length=FOCAL_LENGTH,
+        img_width=image_width,
+        img_height=image_height,
+        width_pixels=video_data.width,
+        height_pixels=video_data.height,
+        opening_angle_x=OPENING_ANGLE_X,
+        opening_angle_y=opening_angle_y
+    )
 
     current_camera.compute_image_pose(cam_q, cam_pos)
     last_camera = copy.deepcopy(current_camera)

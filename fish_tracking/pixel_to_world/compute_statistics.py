@@ -64,11 +64,25 @@ def update_statistics(current_position, time_per_frame_ms, avg_position, avg_vel
     return last_position, [0,0], [0,0], avg_angle, avg_position, avg_velocity
 
 
-def compute_statistics(merged, K, camera_exstrinsics, time_per_frame_ms,
+def compute_statistics(tracks_df, K, camera_exstrinsics, time_per_frame_ms,
                        avg_position, avg_velocity, last_position, target_id, species_label, W, H, ref_geo_lla):
     """
     Compute world coordinate statistics for tracked objects.
-    
+
+    Args:
+        tracks_df: DataFrame with columns x, y, frame (pixel coordinates for one target)
+        K: Camera intrinsic matrix
+        camera_exstrinsics: Array of extrinsic matrices (one per frame)
+        time_per_frame_ms: Time between frames in milliseconds
+        avg_position: Position buffer for temporal averaging
+        avg_velocity: Velocity buffer for temporal averaging
+        last_position: Last known world position
+        target_id: Unique identifier for this target
+        species_label: Species classification label
+        W: Image width in pixels
+        H: Image height in pixels
+        ref_geo_lla: Reference GPS coordinates [lat, lon, alt]
+
     Returns:
         pd.DataFrame: DataFrame containing trajectory statistics with columns:
             avg_pos_x, avg_pos_y, avg_vel_x, avg_vel_y, avg_vel, avg_pixel_pos_x,
@@ -77,12 +91,16 @@ def compute_statistics(merged, K, camera_exstrinsics, time_per_frame_ms,
     """
     rows = []
 
-    for i in range(len(merged)-1): # not always one needs to subtract off -1 only when last extrinsic reached
+    # Process all but the last row (matching original behavior)
+    for i in range(len(tracks_df) - 1):
+        row_data = tracks_df.iloc[i]
+        pixel_pos = np.array([row_data['x'], row_data['y']])
+        frame_num = row_data['frame']
 
-        #position = [W / 2, H / 2]
-        p_world = twoD_to_threeD(merged[i][0].position, camera_exstrinsics[merged[i][0].frame], K)
-        #p_world = twoD_to_threeD(position, camera_exstrinsics[i], K)
+        # Convert pixel to world coordinates
+        p_world = twoD_to_threeD(pixel_pos, camera_exstrinsics[frame_num], K)
 
+        # Update statistics
         last_position, avg_pixel_pos, vel_pixel_pos, avg_angle, avg_position, avg_velocity = update_statistics(
                 p_world, time_per_frame_ms,
                 avg_position, avg_velocity, last_position)
@@ -96,12 +114,12 @@ def compute_statistics(merged, K, camera_exstrinsics, time_per_frame_ms,
             'avg_vel_x': stat.avg_velocity[0],
             'avg_vel_y': stat.avg_velocity[1],
             'avg_vel': np.linalg.norm(stat.avg_velocity),
-            'avg_pixel_pos_x': merged[i][0].position[0],
-            'avg_pixel_pos_y': merged[i][0].position[1],
+            'avg_pixel_pos_x': pixel_pos[0],
+            'avg_pixel_pos_y': pixel_pos[1],
             'vel_pixel_pos_x': stat.vel_pixel_pos[0],
             'vel_pixel_pos_y': stat.vel_pixel_pos[1],
             'angle': stat.avg_angle,
-            'frame': merged[i][0].get_frame(),
+            'frame': frame_num,
             'target_id': target_id,
             'species_label': species_label,
             'ref_latitude': ref_geo_lla[0],

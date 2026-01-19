@@ -16,28 +16,26 @@ class Camera:
     left_right_vector = np.array([0.0, 0.0, 0.0])
     top_bottom_vector = np.array([0.0, 0.0, 0.0])
 
-    def __init__(self):
-        self.focal_length = 0.0
-        self.img_width = 0.0
-        self.img_height = 0.0
-        self.width_pixels = 0
-        self.height_pixels = 0
-        self.opening_angle_x = 0.0
-        self.opening_angle_y = 0.0
+    def __init__(self,
+                 focal_length=0.0,
+                 img_width=0.0,
+                 img_height=0.0,
+                 width_pixels=0,
+                 height_pixels=0,
+                 opening_angle_x=0.0,
+                 opening_angle_y=0.0):
+        # Validate if non-default values are provided
+        if any(v > 0 for v in [focal_length, img_width, img_height, width_pixels, height_pixels]):
+            if focal_length <= 0 or img_width <= 0 or img_height <= 0 or width_pixels <= 0 or height_pixels <= 0:
+                raise ValueError("Invalid initialization values: all dimensions must be positive")
 
-    def init(self, f, i_w, i_h, w_p, h_p, o_x, o_y):
-        if f <= 0 or i_w <= 0 or i_h <= 0 or w_p <= 0 or h_p <= 0:
-            return -1  # Return error type INVALID_INITIALIZATION_VALUES
-
-        self.focal_length = f
-        self.img_width = i_w
-        self.img_height = i_h
-        self.width_pixels = w_p
-        self.height_pixels = h_p
-        self.opening_angle_x = o_x
-        self.opening_angle_y = o_y
-
-        return 0  # Return ATD_OK
+        self.focal_length = focal_length
+        self.img_width = img_width
+        self.img_height = img_height
+        self.width_pixels = width_pixels
+        self.height_pixels = height_pixels
+        self.opening_angle_x = opening_angle_x
+        self.opening_angle_y = opening_angle_y
 
     def copy(self):
         new_cam = Camera()
