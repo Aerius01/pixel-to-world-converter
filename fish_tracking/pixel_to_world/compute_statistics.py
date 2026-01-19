@@ -7,39 +7,62 @@ import pandas as pd
 
 def pixel_to_world_coordinates(pixel_pos, camera_extrinsics, K):
     """
-    Convert 2D pixel coordinates to 3D world coordinates.
+    Convert 2D pixel coordinates to 3D world coordinates using generalized Z-scaling.
+
+    This generalizes the original method to work with arbitrary camera orientations.
+    The old method used a simplified formula that only worked when pitch=0, which made
+    R_inv[2,:] = [0,0,1]. For arbitrary pitch, we compute the correct scale factor by
+    solving for where the projected ray intersects the ocean surface (z=0).
 
     Args:
         pixel_pos: 2D pixel position [x, y]
-        camera_extrinsics: 4x4 camera extrinsic matrix for this frame
+        camera_extrinsics: 4x4 camera extrinsic matrix
         K: 3x3 camera intrinsic matrix
 
     Returns:
-        np.array: 3D world position [x, y, z] in meters
+        np.array: 3D world position [x, y, z] at ocean surface (z≈0) in meters
     """
+    # Convert pixel to homogeneous coordinates
     p = np.array([pixel_pos[0], pixel_pos[1], 1])
 
     # Compute the inverse of the intrinsic matrix
     K_inv = np.linalg.inv(K)
 
-    # Convert the image point to camera coordinates
-    Z_scale_new = -camera_extrinsics[2, 3]
-    p_camera = np.dot(K_inv, p) * Z_scale_new  # [fX/Z, fY/Z, 1] -> [fX, fY, Z]
+    # Get normalized camera coordinates (at unit depth in camera frame)
+    p_camera_normalized = np.dot(K_inv, p)
 
-    # convert to NED
-    p_camera_ned = [-p_camera[1], p_camera[0], p_camera[2]]
+    # Apply NED transformation (camera frame to body frame)
+    # This is part of the coordinate system convention used throughout the codebase
+    p_camera_ned_normalized = np.array([-p_camera_normalized[1],
+                                        p_camera_normalized[0],
+                                        p_camera_normalized[2]])
 
-    # Invert the rotation matrix
+    # Extract rotation matrix and camera position from extrinsics
     R = camera_extrinsics[:3, :3]
     R_inv = np.linalg.inv(R)
+    camera_position = camera_extrinsics[:3, -1]
 
-    # Calculate the translation vector in world coordinates
-    t = camera_extrinsics[:3, -1]
+    # Transform normalized direction to world coordinates
+    direction_world = R_inv.dot(p_camera_ned_normalized)
 
-    # Rotate then Translate
-    p_world = R_inv.dot(p_camera_ned) + t
+    # Compute scale factor such that p_world[2] = 0
+    # Old method used: scale = -camera_extrinsics[2,3] (only works when pitch=0)
+    # General method: scale = -camera_position[2] / direction_world[2]
+
+    if abs(direction_world[2]) < 1e-9:
+        # Ray nearly parallel to ocean - shouldn't happen with downward camera
+        # Fallback: project straight down
+        scale = camera_position[2]
+    else:
+        scale = -camera_position[2] / direction_world[2]
+
+    # Apply scale and transform to world coordinates
+    # This is equivalent to: p_world = camera_position + scale * direction_world
+    p_camera_ned_scaled = scale * p_camera_ned_normalized
+    p_world = R_inv.dot(p_camera_ned_scaled) + camera_position
 
     return p_world
+
 
 def compute_world_velocity(current_position, last_position, time_per_frame_ms):
     """

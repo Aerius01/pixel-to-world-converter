@@ -321,11 +321,13 @@ def convert_pixel_to_world(
         mapped_sensor_idx = frame_to_sensor_idx[i]
 
         # Get gimbal angles as a vector [roll, pitch, yaw] in degrees
+        # Apply GIMBAL_PITCH_OFFSET to correct the gimbal's reference frame.
+        # Raw gimbal pitch (~-90°) + offset (-90°) ≈ 0° in the body frame,
         camera_angles = np.array([
-            gimbal_roll_values[mapped_sensor_idx],
-            gimbal_pitch_values[mapped_sensor_idx],
-            gimbal_yaw_values[mapped_sensor_idx]
-        ]) / CONVERSION_FACTOR
+            gimbal_roll_values[mapped_sensor_idx] / CONVERSION_FACTOR,  # roll
+            gimbal_pitch_values[mapped_sensor_idx] / CONVERSION_FACTOR - np.rad2deg(GIMBAL_PITCH_OFFSET),  # pitch
+            gimbal_yaw_values[mapped_sensor_idx] / CONVERSION_FACTOR    # yaw
+        ])
 
         # Get camera position from RTS smoothed estimates
         camera_position = rts_smoothed_positions[i]
