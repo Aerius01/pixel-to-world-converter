@@ -70,12 +70,6 @@ def extract_video_properties(video_path):
     return fps, width, height, num_frames
 
 
-def progress_callback(frame_idx):
-    """Simple progress callback that prints every 100 frames."""
-    if frame_idx % 100 == 0:
-        print(f"Processing frame {frame_idx}...", end='\r')
-
-
 def main():
     parser = argparse.ArgumentParser(
         description='Convert pixel coordinates from image tracking to world GPS coordinates.',
@@ -242,8 +236,7 @@ Notes:
             video_fps=video_fps,
             video_width=video_width,
             video_height=video_height,
-            video_num_frames=video_num_frames,
-            progress_callback=None if args.quiet else progress_callback
+            video_num_frames=video_num_frames
         )
         
         # Save output to CSV
