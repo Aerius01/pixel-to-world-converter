@@ -7,7 +7,7 @@ import math
 
 from fish_tracking.common.kalman_filter import StaticKalmanFilter
 from fish_tracking.common.globals import *
-from fish_tracking.pixel_to_world.compute_statistics import *
+from fish_tracking.pixel_to_world.compute_statistics import pixel_to_world_coordinates, compute_world_velocity
 from fish_tracking.pixel_to_world.buffer import ATDBuffer
 from fish_tracking.pixel_to_world.rts_smoother import RTSSmoother
 
@@ -511,13 +511,28 @@ def convert_pixel_to_world(
     pixel_size = (SENSOR_WIDTH/video_width, SENSOR_WIDTH/video_width)
     camera_intrinsic = compute_intrinsic_matrix(FOCAL_LENGTH, pixel_size, video_width, video_height)
 
-    # Buffers for temporal averaging
-    position_buffer = ATDBuffer(POSITION_BUFFER_SIZE)
-    velocity_buffer = ATDBuffer(VELOCITY_BUFFER_SIZE)
-    last_world_position = np.array([0, 0, 0])
+    # Pre-allocate DataFrame for trajectory data (more efficient than list append + DataFrame creation)
+    num_detections = len(image_tracks_df)
+    trajectory_df = pd.DataFrame({
+        'avg_pos_x': np.zeros(num_detections),
+        'avg_pos_y': np.zeros(num_detections),
+        'avg_vel_x': np.zeros(num_detections),
+        'avg_vel_y': np.zeros(num_detections),
+        'avg_vel': np.zeros(num_detections),
+        'avg_pixel_pos_x': np.zeros(num_detections),
+        'avg_pixel_pos_y': np.zeros(num_detections),
+        'vel_pixel_pos_x': np.zeros(num_detections),
+        'vel_pixel_pos_y': np.zeros(num_detections),
+        'angle': np.zeros(num_detections),
+        'frame': np.zeros(num_detections, dtype=int),
+        'target_id': np.zeros(num_detections, dtype=int),
+        'species_label': pd.Series([''] * num_detections, dtype=str),
+        'ref_latitude': np.full(num_detections, gps_reference[0]),
+        'ref_longitude': np.full(num_detections, gps_reference[1]),
+        'ref_altitude': np.full(num_detections, gps_reference[2])
+    })
 
-    # Collect trajectory DataFrames for each target
-    trajectory_dfs = []
+    row_idx = 0  # Track current position in DataFrame
 
     # Process each tracked target
     for target_id in image_tracks_df['id'].unique():
@@ -533,25 +548,56 @@ def convert_pixel_to_world(
         # Prepare pixel tracks (round coordinates to integers)
         pixel_tracks = prepare_pixel_tracks(target_rows)
 
-        # Convert to world coordinates and get trajectory DataFrame
-        target_trajectory_df = compute_statistics(
-            pixel_tracks, camera_intrinsic, camera_extrinsics, time_per_frame_ms,
-            position_buffer, velocity_buffer, last_world_position,
-            target_id, species_label,
-            video_width, video_height, gps_reference
-        )
-        trajectory_dfs.append(target_trajectory_df)
+        # BUG FIX #1: Create fresh buffers for each target to avoid cross-target contamination
+        position_buffer = ATDBuffer(POSITION_BUFFER_SIZE)
+        velocity_buffer = ATDBuffer(VELOCITY_BUFFER_SIZE)
 
-    # Concatenate all target trajectories into single DataFrame
-    if trajectory_dfs:
-        trajectory_df = pd.concat(trajectory_dfs, ignore_index=True)
-    else:
-        # Return empty DataFrame with correct columns if no trajectories
-        trajectory_df = pd.DataFrame(columns=[
-            'avg_pos_x', 'avg_pos_y', 'avg_vel_x', 'avg_vel_y', 'avg_vel',
-            'avg_pixel_pos_x', 'avg_pixel_pos_y', 'vel_pixel_pos_x', 'vel_pixel_pos_y',
-            'angle', 'frame', 'target_id', 'species_label',
-            'ref_latitude', 'ref_longitude', 'ref_altitude'
-        ])
-    
+        # Process all detections
+        for i in range(len(pixel_tracks)):
+            # Current detection
+            row_data = pixel_tracks.iloc[i]
+            pixel_pos = np.array([row_data['x'], row_data['y']])
+            frame_num = row_data['frame']
+
+            # Convert position to world coordinates
+            world_pos = pixel_to_world_coordinates(pixel_pos, camera_extrinsics[frame_num], camera_intrinsic)
+
+            # BUG FIX #2: Compute forward-looking velocity (except for last frame)
+            if i < len(pixel_tracks) - 1:
+                # Next detection (used to compute velocity)
+                next_row = pixel_tracks.iloc[i + 1]
+                next_pixel_pos = np.array([next_row['x'], next_row['y']])
+                next_frame_num = next_row['frame']
+                next_world_pos = pixel_to_world_coordinates(next_pixel_pos, camera_extrinsics[next_frame_num], camera_intrinsic)
+
+                # Compute velocity from current to next position
+                world_velocity = compute_world_velocity(next_world_pos, world_pos, time_per_frame_ms)
+                velocity_buffer.update(world_velocity)
+            # else: For last frame, keep previous velocity (already in buffer)
+
+            # Update position buffer
+            position_buffer.update(world_pos)
+
+            # Compute heading angle from averaged velocity
+            avg_angle = math.atan2(velocity_buffer.value[1], velocity_buffer.value[0]) * RAD2DEG
+
+            # Write trajectory data directly to pre-allocated DataFrame
+            trajectory_df.loc[row_idx, 'avg_pos_x'] = position_buffer.value[0]
+            trajectory_df.loc[row_idx, 'avg_pos_y'] = position_buffer.value[1]
+            trajectory_df.loc[row_idx, 'avg_vel_x'] = velocity_buffer.value[0]
+            trajectory_df.loc[row_idx, 'avg_vel_y'] = velocity_buffer.value[1]
+            trajectory_df.loc[row_idx, 'avg_vel'] = np.linalg.norm(velocity_buffer.value)
+            trajectory_df.loc[row_idx, 'avg_pixel_pos_x'] = pixel_pos[0]
+            trajectory_df.loc[row_idx, 'avg_pixel_pos_y'] = pixel_pos[1]
+            trajectory_df.loc[row_idx, 'angle'] = avg_angle
+            trajectory_df.loc[row_idx, 'frame'] = frame_num
+            trajectory_df.loc[row_idx, 'target_id'] = target_id
+            trajectory_df.loc[row_idx, 'species_label'] = species_label
+
+            # Progress logging
+            if row_idx > 0 and not (row_idx - 1) % DISPLAY_STEPS:
+                print("writing stat number " + str(row_idx - 1))
+
+            row_idx += 1
+
     return trajectory_df
