@@ -62,19 +62,24 @@ class RTSSmoother:
             return self.x, self.P
 
         # Predict forward from current KF estimate
-        x_p = self.A.dot(x_kf)
-        P_p = self.A.dot(P_kf).dot(self.A.T) + self.Q
+        x_p = self.A @ x_kf
+        # Reuse intermediate result for efficiency
+        temp = self.A @ P_kf
+        P_p = temp @ self.A.T + self.Q
 
-        # Compute smoother gain
-        G = P_kf.dot(self.A.T).dot(np.linalg.inv(P_p))
+        # Compute smoother gain using solve (more stable than inverse)
+        # G = P_kf @ A^T @ inv(P_p) = solve(P_p^T, (P_kf @ A^T)^T)^T
+        P_kf_AT = P_kf @ self.A.T
+        G = np.linalg.solve(P_p.T, P_kf_AT.T).T
 
         # Compute residuals between smoothed and predicted
         x_residual = self.x - x_p
         P_residual = self.P - P_p
 
         # Compute smoothed estimates
-        self.x = x_kf + np.dot(G, x_residual)
-        self.P = P_kf + G.dot(P_residual).dot(G.T)
+        self.x = x_kf + (G @ x_residual)
+        temp_P = G @ P_residual
+        self.P = P_kf + (temp_P @ G.T)
 
         return self.x, self.P
 

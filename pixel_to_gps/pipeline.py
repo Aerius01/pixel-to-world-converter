@@ -5,9 +5,10 @@ import pandas as pd
 
 from .config import (
     KF_DOF, FOCAL_LENGTH, SENSOR_WIDTH,
-    GIMBAL_PITCH_OFFSET, CONVERSION_FACTOR
+    GIMBAL_PITCH_OFFSET, CONVERSION_FACTOR,
+    KF_MEASUREMENT_NOISE_SCALE, KF_PROCESS_NOISE_SCALE, KF_INITIAL_COVARIANCE_SCALE
 )
-from .preprocessing import align_frames_to_sensors, get_velocity_enu, get_pose_gps
+from .preprocessing import align_frames_to_sensors, get_pose_gps
 from .pose_estimation import (
     StaticKalmanFilter, RTSSmoother,
     compute_extrinsic_matrix, compute_intrinsic_matrix
@@ -84,34 +85,47 @@ def convert_pixel_to_world(
     # The static noise matrices date back to Pia's ported implementation
     # The redundant Kalman filter and dates back to the C++ implementation
 
-    # Initialize Kalman filter with constant noise matrices (matching original implementation)
+    # Pre-extract all velocities as numpy arrays (avoid repeated DataFrame access)
+    # Convert from NED to ENU: [North→East(negated), East→North, Down→Up(negated)]
+    velocities_enu = np.column_stack([
+        -sensor_data_df['velocityX(mps)'].values,  # North → East (negated)
+        sensor_data_df['velocityY(mps)'].values,   # East → North
+        -sensor_data_df['velocityZ(mps)'].values   # Down → Up (negated)
+    ])
+
+    # Pre-compute time differences for all frames
+    time_diffs = np.abs(sensor_times[frame_to_sensor_idx] - frame_times)
     frame_duration = 1.0 / video_fps
+    use_measurement = time_diffs < frame_duration
+
+    # Initialize Kalman filter before loop (matching original implementation)
+    first_measurement = np.concatenate((
+        drone_positions_gps[frame_to_sensor_idx[0]],
+        velocities_enu[frame_to_sensor_idx[0]]
+    ))
+    kalman_filter = StaticKalmanFilter(
+        initial_state=first_measurement,
+        R=KF_MEASUREMENT_NOISE_SCALE * np.eye(KF_DOF),
+        Q=KF_PROCESS_NOISE_SCALE * np.eye(KF_DOF),
+        P_initial=KF_INITIAL_COVARIANCE_SCALE * np.eye(KF_DOF)
+    )
+
+    # Main Kalman filter loop with pre-computed arrays
     for k in range(video_num_frames):
-        # Get the sensor data row index for this frame using pre-computed mapping
-        current_time = frame_times[k]
         mapped_sensor_idx = frame_to_sensor_idx[k]
 
-        # On first iteration, initialize; otherwise predict
-        if k == 0:
-            # Initialize with first measurement (matching original updateNumber==1 behavior)
-            first_measurement = np.concatenate((drone_positions_gps[mapped_sensor_idx], get_velocity_enu(sensor_data_df, mapped_sensor_idx)))
-            kalman_filter = StaticKalmanFilter(
-                initial_state=first_measurement,
-                R=100 * np.eye(6),      # Constant measurement noise
-                Q=np.eye(6),            # Constant process noise
-                P_initial=np.eye(6)     # Initial covariance
-            )
-        else:
+        # On first iteration, already initialized; otherwise predict
+        if k > 0:
             # Predict step
             kalman_filter.predict(frame_duration)
 
             # Use measurement if sensor time is close to frame time
-            if np.abs(sensor_times[mapped_sensor_idx] - current_time) < frame_duration:
-                # Get velocity directly from sensor data at the matched index
-                current_velocity = get_velocity_enu(sensor_data_df, mapped_sensor_idx)
-
-                # Combine position and velocity measurements
-                measurement = np.concatenate((drone_positions_gps[mapped_sensor_idx], current_velocity))
+            if use_measurement[k]:
+                # Combine position and velocity measurements from pre-computed arrays
+                measurement = np.concatenate((
+                    drone_positions_gps[mapped_sensor_idx],
+                    velocities_enu[mapped_sensor_idx]
+                ))
                 kalman_filter.update(measurement)
 
         # Extract state and covariance after initialization/update
@@ -121,8 +135,10 @@ def convert_pixel_to_world(
         # Store filtered estimates
         kalman_estimated_positions[k] = filtered_state[0:3]
         kalman_estimated_velocities[k] = filtered_state[3:6]
-        kalman_estimated_position_variances[k] = np.diag(filtered_variance)[:3]
-        kalman_estimated_velocity_variances[k] = np.diag(filtered_variance)[3:]
+        # Extract diagonal once (np.diagonal returns a view when possible, faster than np.diag)
+        diag_variance = np.diagonal(filtered_variance)
+        kalman_estimated_position_variances[k] = diag_variance[:3]
+        kalman_estimated_velocity_variances[k] = diag_variance[3:]
 
     # ============================================================
     # SECTION 3: RTS backward smoother for improved estimates
@@ -137,12 +153,18 @@ def convert_pixel_to_world(
     # Initialize RTS smoother
     smoother = RTSSmoother(frame_duration, dof=KF_DOF)
 
+    # Pre-concatenate positions and velocities outside the loop
+    # Each row is a full 6-element state vector for one frame
+    kalman_states = np.hstack([kalman_estimated_positions, kalman_estimated_velocities])
+    kalman_diag_variances = np.hstack([kalman_estimated_position_variances,
+                                        kalman_estimated_velocity_variances])
+
     # Each iteration of the loop updates the internal state of the smoother before
     # being passed into the next iteration, resulting in a sequential dependency chain
     for k in range(video_num_frames - 1, -1, -1):
-        kalman_state = np.concatenate((kalman_estimated_positions[k], kalman_estimated_velocities[k]))
-        kalman_variance = np.eye(6) * np.concatenate((kalman_estimated_position_variances[k], kalman_estimated_velocity_variances[k]))
-        rts_smoothed_state, _ = smoother.update(kalman_state, kalman_variance)
+        # Construct diagonal covariance matrix more efficiently
+        kalman_variance = np.diag(kalman_diag_variances[k])
+        rts_smoothed_state, _ = smoother.update(kalman_states[k], kalman_variance)
 
         rts_smoothed_positions[k] = rts_smoothed_state[0:3]
 
@@ -152,22 +174,20 @@ def convert_pixel_to_world(
     # Pre-allocate numpy array for extrinsic matrices (each is 4x4)
     camera_extrinsics = np.zeros((video_num_frames, 4, 4))
 
-    # It's more efficient to extract the 1D numpy arrays once and then index into them
-    # rather than calling the dataframe accessor functions repeatedly in the loop.
-    gimbal_yaw_values = sensor_data_df['gimbalYawRaw'].values
-    gimbal_pitch_values = sensor_data_df['gimbalPitchRaw'].values
-    gimbal_roll_values = sensor_data_df['gimbalRollRaw'].values
+    # Pre-convert all gimbal angles once (vectorized operations are faster)
+    gimbal_roll_deg = sensor_data_df['gimbalRollRaw'].values / CONVERSION_FACTOR
+    gimbal_pitch_deg = (sensor_data_df['gimbalPitchRaw'].values / CONVERSION_FACTOR) - np.rad2deg(GIMBAL_PITCH_OFFSET)
+    gimbal_yaw_deg = sensor_data_df['gimbalYawRaw'].values / CONVERSION_FACTOR
 
     for i in range(video_num_frames):
         mapped_sensor_idx = frame_to_sensor_idx[i]
 
         # Get gimbal angles as a vector [roll, pitch, yaw] in degrees
-        # Apply GIMBAL_PITCH_OFFSET to correct the gimbal's reference frame.
-        # Raw gimbal pitch (~-90°) + offset (-90°) ≈ 0° in the body frame,
+        # Gimbal angles are pre-converted with pitch offset already applied
         camera_angles = np.array([
-            gimbal_roll_values[mapped_sensor_idx] / CONVERSION_FACTOR,  # roll
-            gimbal_pitch_values[mapped_sensor_idx] / CONVERSION_FACTOR - np.rad2deg(GIMBAL_PITCH_OFFSET),  # pitch
-            gimbal_yaw_values[mapped_sensor_idx] / CONVERSION_FACTOR    # yaw
+            gimbal_roll_deg[mapped_sensor_idx],   # roll
+            gimbal_pitch_deg[mapped_sensor_idx],  # pitch (with GIMBAL_PITCH_OFFSET applied)
+            gimbal_yaw_deg[mapped_sensor_idx]     # yaw
         ])
 
         # Get camera position from RTS smoothed estimates
@@ -187,10 +207,14 @@ def convert_pixel_to_world(
     pixel_size = (SENSOR_WIDTH/video_width, SENSOR_WIDTH/video_width)
     camera_intrinsic = compute_intrinsic_matrix(FOCAL_LENGTH, pixel_size, video_width, video_height)
 
+    # Pre-compute inverse for efficiency (avoid repeated inversion in pixel_to_world)
+    camera_intrinsic_inv = np.linalg.inv(camera_intrinsic)
+
     # Initialize trajectory processor with camera parameters
     processor = TrajectoryProcessor(
         camera_extrinsics=camera_extrinsics,
         camera_intrinsic=camera_intrinsic,
+        camera_intrinsic_inv=camera_intrinsic_inv,
         video_fps=video_fps,
         gps_reference=gps_reference
     )
@@ -198,11 +222,10 @@ def convert_pixel_to_world(
     # Collect trajectory records from all targets
     all_trajectory_records = []
 
-    # Process each tracked target (trajectory id)
-    for target_id in image_tracks_df['id'].unique():
-        # Filter DataFrame for current target
-        target_rows = image_tracks_df[image_tracks_df['id'] == target_id]
+    # Process each tracked target using groupby (more efficient than filtering repeatedly)
+    grouped = image_tracks_df.groupby('id', sort=False)
 
+    for target_id, target_rows in grouped:
         # Extract species label using majority voting
         species_label = extract_species_label(target_rows)
 

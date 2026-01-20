@@ -4,22 +4,15 @@ import math
 import numpy as np
 
 # ============================================================
-# Required Input Data Columns
-# ============================================================
-SENSOR_COLUMNS = [
-    'time(millisecond)', 'latitude', 'longitude', 'altitude(m)',
-    'velocityX(mps)', 'velocityY(mps)', 'velocityZ(mps)',
-    'gimbalPitchRaw', 'gimbalRollRaw', 'gimbalYawRaw'
-]
-
-IMAGE_TRACKS_COLUMNS = [
-    'id', 'x', 'y', 'frame', 'label'
-]
-
-# ============================================================
 # Kalman Filter Parameters
 # ============================================================
 KF_DOF = 6  # state size [x, y, z, vx, vy, vz]
+
+# Kalman filter noise parameters (tuned empirically)
+# See CLAUDE.md for detailed explanation and tuning methodology
+KF_MEASUREMENT_NOISE_SCALE = 100.0  # Measurement noise covariance scale factor (R = scale * I)
+KF_PROCESS_NOISE_SCALE = 1.0        # Process noise covariance scale factor (Q = scale * I)
+KF_INITIAL_COVARIANCE_SCALE = 1.0   # Initial state covariance scale factor (P = scale * I)
 
 # ============================================================
 # Camera Hardware Specifications
@@ -39,6 +32,11 @@ CONVERSION_FACTOR = 10.0  # Converting raw gimbal angles to real angles
 VELOCITY_BUFFER_SIZE = 60  # Number of frames for velocity averaging
 POSITION_BUFFER_SIZE = 1   # Number of frames for position averaging
 MAX_VELOCITY = 10.0        # Maximum velocity threshold in m/s (filter out larger velocities)
+
+# ============================================================
+# Projection Tolerances
+# ============================================================
+RAY_PARALLEL_TOLERANCE = 1e-9  # Tolerance for detecting ray parallel to ocean surface (radians)
 
 # ============================================================
 # Mathematical Constants

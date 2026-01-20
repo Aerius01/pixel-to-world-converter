@@ -20,7 +20,7 @@ import cv2
 import pandas as pd
 
 from pixel_to_gps import convert_pixel_to_world
-from pixel_to_gps.config import SENSOR_COLUMNS, IMAGE_TRACKS_COLUMNS
+from pixel_to_gps.schema import DRONE_LOG_SCHEMA, IMAGE_TRACKS_SCHEMA
 
 
 class ValidationError(Exception):
@@ -72,22 +72,22 @@ def validate_output_path(output_path):
             raise ValidationError(f"Cannot create output directory {output_dir}: {e}")
 
 
-def validate_csv_columns(csv_path, required_columns, file_description):
-    """Validate that a CSV file contains all required columns.
+def validate_csv_schema(csv_path, schema, file_description):
+    """Validate that a CSV file matches the expected schema.
 
     Args:
         csv_path (str): Path to the CSV file
-        required_columns (list): List of required column names
+        schema: Schema object with validate() method
         file_description (str): Human-readable description of the file
 
     Raises:
-        DataLoadError: If any required columns are missing
+        DataLoadError: If schema validation fails
     """
     csv_preview = pd.read_csv(csv_path, nrows=0)  # Read only header
-    missing_columns = [col for col in required_columns if col not in csv_preview.columns]
+    missing_columns = schema.validate(csv_preview)
     if missing_columns:
         error_msg = f"{file_description} is missing required columns: {', '.join(missing_columns)}\n"
-        error_msg += f"Required columns: {', '.join(required_columns)}"
+        error_msg += f"Required columns: {', '.join(schema.get_required_columns())}"
         raise DataLoadError(error_msg)
 
 
@@ -181,19 +181,19 @@ Notes:
         # Load CSV files into DataFrames
         print("\nLoading input files into memory...")
 
-        # Validate required columns are present
-        validate_csv_columns(args.image_tracks, IMAGE_TRACKS_COLUMNS, "Image tracks file")
-        validate_csv_columns(args.drone_log, SENSOR_COLUMNS, "Drone log file")
+        # Validate schemas
+        validate_csv_schema(args.image_tracks, IMAGE_TRACKS_SCHEMA, "Image tracks file")
+        validate_csv_schema(args.drone_log, DRONE_LOG_SCHEMA, "Drone log file")
 
         # Load the actual data
-        image_tracks_df = pd.read_csv(args.image_tracks, usecols=IMAGE_TRACKS_COLUMNS)
+        image_tracks_df = pd.read_csv(args.image_tracks, usecols=IMAGE_TRACKS_SCHEMA.get_required_columns())
         print(f"  Loaded {len(image_tracks_df)} image track records")
 
-        sensor_data_df = pd.read_csv(args.drone_log, usecols=SENSOR_COLUMNS, dtype=float)
+        sensor_data_df = pd.read_csv(args.drone_log, usecols=DRONE_LOG_SCHEMA.get_required_columns(), dtype=float)
         print(f"  Loaded {len(sensor_data_df)} sensor records")
 
         # Verify all velocity measurements are populated with non-NaN values
-        velocity_columns = [col for col in SENSOR_COLUMNS if 'vel' in col.lower()]
+        velocity_columns = [DRONE_LOG_SCHEMA.vel_x_col, DRONE_LOG_SCHEMA.vel_y_col, DRONE_LOG_SCHEMA.vel_z_col]
         for col in velocity_columns:
             if sensor_data_df[col].isna().any():
                 missing_count = sensor_data_df[col].isna().sum()

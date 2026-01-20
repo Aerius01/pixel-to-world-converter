@@ -25,10 +25,23 @@ def align_frames_to_sensors(video_fps, video_num_frames, sensor_data_df):
     sensor_times = (sensor_data_df['time(millisecond)'].values - sensor_data_df['time(millisecond)'].iloc[0]) / 1000
 
     # For each frame, find the sensor data row with the closest timestamp
-    frame_to_sensor_idx = np.array([
-        np.argmin(np.abs(sensor_times - frame_time))
-        for frame_time in frame_times
-    ])
+    # Use binary search (O(n log m)) instead of linear search (O(n*m))
+    # searchsorted finds insertion points; we need to check both neighbors for closest match
+    insert_idx = np.searchsorted(sensor_times, frame_times, side='left')
+
+    # Vectorized computation of closest neighbor indices
+    # Clamp insert_idx to valid range for left neighbor
+    left_idx = np.clip(insert_idx - 1, 0, len(sensor_times) - 1)
+    # Clamp insert_idx to valid range for right neighbor
+    right_idx = np.clip(insert_idx, 0, len(sensor_times) - 1)
+
+    # Compute distances to left and right neighbors
+    left_dist = np.abs(sensor_times[left_idx] - frame_times)
+    right_dist = np.abs(sensor_times[right_idx] - frame_times)
+
+    # Choose the closer neighbor (prefer left when equal, matching original argmin behavior)
+    # argmin returns the first (lowest index) when there are ties
+    frame_to_sensor_idx = np.where(left_dist <= right_dist, left_idx, right_idx)
 
     return frame_times, sensor_times, frame_to_sensor_idx
 
@@ -67,22 +80,30 @@ def get_pose_gps(sensor_df):
         sensor_df (pd.DataFrame): Sensor data with latitude, longitude, altitude columns
 
     Returns:
-        list: List of [east, north, up] positions in meters relative to first GPS position
+        np.ndarray: Array of [east, north, up] positions in meters relative to first GPS position
+                    Shape: (n_sensors, 3)
     """
-    pose_gps = []
+    # Extract all GPS coordinates as numpy arrays for vectorized processing
+    lats = sensor_df['latitude'].values
+    lons = sensor_df['longitude'].values
+    alts = sensor_df['altitude(m)'].values
 
-    for i in range(len(sensor_df)):
-        lat = sensor_df.iloc[i]['latitude']
-        lon = sensor_df.iloc[i]['longitude']
-        alt = sensor_df.iloc[i]['altitude(m)']
+    # Get reference point (first GPS position)
+    ref_lat = lats[0]
+    ref_lon = lons[0]
+    ref_alt = 0  # Reference altitude at sea level
 
-        # Convert to ENU coordinates relative to reference (first GPS position)
-        # Reference altitude at sea level == 0
-        # This call converts from geodetic (latitude, longitude, altitude) to local ENU (north, east, up) coordinates (in meters).
-        enu_coords = pm.geodetic2enu(lat, lon, alt, sensor_df.iloc[0]['latitude'], sensor_df.iloc[0]['longitude'], 0,
-                              ell=pm.Ellipsoid.from_name("wgs84"), deg=True)
+    # Vectorized conversion to ENU coordinates
+    # pymap3d.geodetic2enu returns (east, north, up) and accepts arrays
+    east, north, up = pm.geodetic2enu(
+        lats, lons, alts,
+        ref_lat, ref_lon, ref_alt,
+        ell=pm.Ellipsoid.from_name("wgs84"),
+        deg=True
+    )
 
-        # Reorder to [east, north, up] and flip Z-axis
-        pose_gps.append([enu_coords[1], enu_coords[0], -enu_coords[2]])
+    # Stack into (N, 3) array with [north, east, -up] order to match original behavior
+    # Note: Original code swapped east/north with [enu_coords[1], enu_coords[0], -enu_coords[2]]
+    pose_gps = np.column_stack([north, east, -up])
 
     return pose_gps

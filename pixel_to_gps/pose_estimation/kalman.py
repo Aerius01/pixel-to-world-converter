@@ -1,6 +1,11 @@
 """Kalman filter implementations for camera pose estimation."""
 
 import numpy as np
+import warnings
+
+# Numerical stability constants
+CONDITION_NUMBER_THRESHOLD = 1e10  # Warn if matrix is ill-conditioned
+REGULARIZATION_EPSILON = 1e-6      # Regularization term for ill-conditioned matrices
 
 
 class BaseKalmanFilter:
@@ -49,9 +54,11 @@ class BaseKalmanFilter:
         self._update_process_noise(dt)
 
         # Standard prediction equations
-        self.state = np.dot(self.F, self.state)
-        Ft = self.F.transpose()
-        self.P = np.dot(np.dot(self.F, self.P), Ft) + self.Q
+        # Optimized: use @ operator and minimize intermediate allocations
+        self.state = self.F @ self.state
+        # Compute F*P*F^T + Q efficiently by reusing intermediate result
+        temp = self.F @ self.P
+        self.P = temp @ self.F.T + self.Q
 
     def _update_process_noise(self, dt):
         """
@@ -69,21 +76,41 @@ class BaseKalmanFilter:
         Args:
             z: Measurement vector
         """
-        Ht = self.H.transpose()
+        # Compute innovation (residual)
+        y = z - (self.H @ self.state)
 
-        PHt = np.dot(self.P, Ht)
-        y = z - np.dot(self.H, self.state)
-        S = np.dot(self.H, PHt) + self.R
+        # Compute innovation covariance S = H*P*H^T + R
+        # Reuse intermediate result to avoid extra allocation
+        temp = self.H @ self.P
+        S = temp @ self.H.T + self.R
 
-        # Compute Kalman gain
-        K = np.dot(PHt, np.linalg.inv(S))
+        # Check condition number for numerical stability
+        cond = np.linalg.cond(S)
+        if cond > CONDITION_NUMBER_THRESHOLD:
+            warnings.warn(
+                f"Ill-conditioned innovation covariance (cond={cond:.2e}). "
+                f"Adding regularization term.",
+                RuntimeWarning
+            )
+            # Add regularization to diagonal
+            S += np.eye(len(S)) * REGULARIZATION_EPSILON
+
+        # Compute Kalman gain using solve (more stable than explicit inverse)
+        # K = P*H^T*inv(S) = solve(S^T, (P*H^T)^T)^T
+        PHt = self.P @ self.H.T
+        K = np.linalg.solve(S.T, PHt.T).T
 
         # Update state vector
-        self.state = self.state + np.dot(K, y)
+        self.state = self.state + (K @ y)
 
         # Update covariance matrix using Joseph form (numerically stable)
-        IKH = self.I - np.dot(K, self.H)
-        self.P = np.dot(np.dot(IKH, self.P), IKH.transpose()) + np.dot(np.dot(K, self.R), K.transpose())
+        IKH = self.I - (K @ self.H)
+        temp1 = IKH @ self.P
+        temp2 = K @ self.R
+        self.P = (temp1 @ IKH.T) + (temp2 @ K.T)
+
+        # Ensure covariance remains symmetric (numerical errors can break symmetry)
+        self.P = (self.P + self.P.T) / 2
 
 
 class StaticKalmanFilter(BaseKalmanFilter):

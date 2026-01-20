@@ -3,6 +3,7 @@
 import numpy as np
 import pandas as pd
 import math
+from collections import deque
 
 from ..config import POSITION_BUFFER_SIZE, VELOCITY_BUFFER_SIZE, RAD2DEG
 from .pixel_to_world import pixel_to_world_coordinates, compute_world_velocity
@@ -10,7 +11,7 @@ from .pixel_to_world import pixel_to_world_coordinates, compute_world_velocity
 
 def create_rolling_buffer(size):
     """
-    Create a rolling average buffer for 3D vectors.
+    Create a rolling average buffer for 3D vectors using deque with O(1) incremental averaging.
 
     Args:
         size (int): Size of the rolling buffer
@@ -20,15 +21,23 @@ def create_rolling_buffer(size):
             - update_func(new_value): Updates buffer with new 3D vector and returns new average
             - get_value_func(): Returns current average
     """
-    buffer = np.zeros((size, 3))
-    idx = [0]  # Mutable container for closure
+    buffer = deque(maxlen=size)
     avg = np.zeros(3)
+    running_sum = np.zeros(3)
 
     def update(new_value):
-        nonlocal avg
-        buffer[idx[0]] = new_value
-        idx[0] = (idx[0] + 1) % size
-        avg = buffer.mean(axis=0)
+        nonlocal avg, running_sum
+
+        # Update running sum incrementally for O(1) complexity
+        if len(buffer) == size:
+            # Buffer is full - remove oldest value from sum
+            running_sum -= buffer[0]
+
+        buffer.append(new_value)
+        running_sum += new_value
+
+        # Compute average from running sum (O(1) instead of O(n))
+        avg = running_sum / len(buffer)
         return avg
 
     def get_value():
@@ -46,18 +55,20 @@ class TrajectoryProcessor:
     temporal smoothing buffers.
     """
 
-    def __init__(self, camera_extrinsics, camera_intrinsic, video_fps, gps_reference):
+    def __init__(self, camera_extrinsics, camera_intrinsic, camera_intrinsic_inv, video_fps, gps_reference):
         """
         Initialize the trajectory processor.
 
         Args:
             camera_extrinsics (np.ndarray): Array of 4x4 extrinsic matrices (one per frame)
             camera_intrinsic (np.ndarray): 3x3 camera intrinsic matrix
+            camera_intrinsic_inv (np.ndarray): Pre-computed inverse of camera_intrinsic
             video_fps (float): Video frames per second
             gps_reference (list): Reference GPS coordinates [latitude, longitude, altitude]
         """
         self.camera_extrinsics = camera_extrinsics
         self.camera_intrinsic = camera_intrinsic
+        self.camera_intrinsic_inv = camera_intrinsic_inv
         self.time_per_frame_ms = 1000.0 / video_fps
         self.gps_reference = gps_reference
 
@@ -80,20 +91,24 @@ class TrajectoryProcessor:
 
         trajectory_records = []
 
+        # Convert to numpy arrays for faster iteration (avoid DataFrame .iloc overhead)
+        pixel_x = pixel_tracks['x'].values
+        pixel_y = pixel_tracks['y'].values
+        frame_nums = pixel_tracks['frame'].values
+        n_detections = len(pixel_tracks)
+
         # Process all detections for this target
-        for i in range(len(pixel_tracks)):
+        for i in range(n_detections):
             # Get current detection
-            detection_row = pixel_tracks.iloc[i]
-            pixel_pos = np.array([detection_row['x'], detection_row['y']])
-            frame_num = detection_row['frame']
+            pixel_pos = np.array([pixel_x[i], pixel_y[i]])
+            frame_num = frame_nums[i]
 
             # Get next detection info if available (for velocity computation)
             next_detection = None
-            if i < len(pixel_tracks) - 1:
-                next_row = pixel_tracks.iloc[i + 1]
+            if i < n_detections - 1:
                 next_detection = {
-                    'pixel_pos': np.array([next_row['x'], next_row['y']]),
-                    'frame_num': next_row['frame']
+                    'pixel_pos': np.array([pixel_x[i + 1], pixel_y[i + 1]]),
+                    'frame_num': frame_nums[i + 1]
                 }
 
             # Compute world position and velocity (pure function)
@@ -149,7 +164,8 @@ class TrajectoryProcessor:
         world_pos = pixel_to_world_coordinates(
             pixel_pos,
             self.camera_extrinsics[frame_num],
-            self.camera_intrinsic
+            self.camera_intrinsic,
+            self.camera_intrinsic_inv
         )
 
         # Compute velocity using forward differences (current to next frame)
@@ -158,7 +174,8 @@ class TrajectoryProcessor:
             next_world_pos = pixel_to_world_coordinates(
                 next_detection['pixel_pos'],
                 self.camera_extrinsics[next_detection['frame_num']],
-                self.camera_intrinsic
+                self.camera_intrinsic,
+                self.camera_intrinsic_inv
             )
 
             # Compute velocity vector from current to next position
@@ -203,8 +220,6 @@ class TrajectoryProcessor:
             'avg_vel': np.linalg.norm(avg_velocity),
             'avg_pixel_pos_x': pixel_pos[0],
             'avg_pixel_pos_y': pixel_pos[1],
-            'vel_pixel_pos_x': 0.0,  # Not used in current implementation
-            'vel_pixel_pos_y': 0.0,  # Not used in current implementation
             'angle': avg_angle,
             'frame': frame_num,
             'target_id': target_id,

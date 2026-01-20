@@ -1,10 +1,10 @@
 """Pixel-to-world coordinate projection functions."""
 
 import numpy as np
-from ..config import MAX_VELOCITY
+from ..config import MAX_VELOCITY, RAY_PARALLEL_TOLERANCE
 
 
-def pixel_to_world_coordinates(pixel_pos, camera_extrinsics, K):
+def pixel_to_world_coordinates(pixel_pos, camera_extrinsics, K, K_inv=None):
     """
     Convert 2D pixel coordinates to 3D world coordinates using generalized Z-scaling.
 
@@ -17,6 +17,7 @@ def pixel_to_world_coordinates(pixel_pos, camera_extrinsics, K):
         pixel_pos: 2D pixel position [x, y]
         camera_extrinsics: 4x4 camera extrinsic matrix
         K: 3x3 camera intrinsic matrix
+        K_inv: (optional) Pre-computed inverse of K for efficiency
 
     Returns:
         np.array: 3D world position [x, y, z] at ocean surface (z≈0) in meters
@@ -24,11 +25,12 @@ def pixel_to_world_coordinates(pixel_pos, camera_extrinsics, K):
     # Convert pixel to homogeneous coordinates
     p = np.array([pixel_pos[0], pixel_pos[1], 1])
 
-    # Compute the inverse of the intrinsic matrix
-    K_inv = np.linalg.inv(K)
+    # Use pre-computed inverse if available, otherwise compute it
+    if K_inv is None:
+        K_inv = np.linalg.inv(K)
 
     # Get normalized camera coordinates (at unit depth in camera frame)
-    p_camera_normalized = np.dot(K_inv, p)
+    p_camera_normalized = K_inv @ p
 
     # Apply NED transformation (camera frame to body frame)
     # This is part of the coordinate system convention used throughout the codebase
@@ -38,17 +40,18 @@ def pixel_to_world_coordinates(pixel_pos, camera_extrinsics, K):
 
     # Extract rotation matrix and camera position from extrinsics
     R = camera_extrinsics[:3, :3]
-    R_inv = np.linalg.inv(R)
+    # R is orthogonal, so R^-1 = R^T (much faster than explicit inverse)
+    R_inv = R.T
     camera_position = camera_extrinsics[:3, -1]
 
     # Transform normalized direction to world coordinates
-    direction_world = R_inv.dot(p_camera_ned_normalized)
+    direction_world = R_inv @ p_camera_ned_normalized
 
     # Compute scale factor such that p_world[2] = 0
     # Old method used: scale = -camera_extrinsics[2,3] (only works when pitch=0)
     # General method: scale = -camera_position[2] / direction_world[2]
 
-    if abs(direction_world[2]) < 1e-9:
+    if abs(direction_world[2]) < RAY_PARALLEL_TOLERANCE:
         # Ray nearly parallel to ocean - shouldn't happen with downward camera
         # Fallback: project straight down
         scale = camera_position[2]
@@ -58,7 +61,7 @@ def pixel_to_world_coordinates(pixel_pos, camera_extrinsics, K):
     # Apply scale and transform to world coordinates
     # This is equivalent to: p_world = camera_position + scale * direction_world
     p_camera_ned_scaled = scale * p_camera_ned_normalized
-    p_world = R_inv.dot(p_camera_ned_scaled) + camera_position
+    p_world = (R_inv @ p_camera_ned_scaled) + camera_position
 
     return p_world
 
