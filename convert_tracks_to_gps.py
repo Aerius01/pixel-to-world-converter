@@ -18,47 +18,94 @@ import sys
 import os
 import cv2
 import pandas as pd
-from pathlib import Path
 
-from fish_tracking.pixel_to_world.convert_pixel_to_world import convert_pixel_to_world
+from pixel_to_gps import convert_pixel_to_world
+from pixel_to_gps.config import SENSOR_COLUMNS, IMAGE_TRACKS_COLUMNS
 
-# Required sensor data columns (all cast to float)
-SENSOR_COLUMNS = [
-    'time(millisecond)', 'latitude', 'longitude', 'altitude(m)',
-    'velocityX(mps)', 'velocityY(mps)', 'velocityZ(mps)',
-    'pitch(deg)', 'roll(deg)', 'yaw(deg)', 'isTakingVideo',
-    'gimbalPitchRaw', 'gimbalRollRaw', 'gimbalYawRaw'
-]
+
+class ValidationError(Exception):
+    """Raised when input validation fails."""
+    pass
+
+
+class VideoError(Exception):
+    """Raised when video file cannot be processed."""
+    pass
+
+
+class DataLoadError(Exception):
+    """Raised when CSV data cannot be loaded or is invalid."""
+    pass
 
 
 def validate_file_exists(filepath, file_description):
-    """Validate that a file exists and is readable."""
+    """Validate that a file exists and is readable.
+
+    Args:
+        filepath (str): Path to the file to validate
+        file_description (str): Human-readable description of the file
+
+    Raises:
+        ValidationError: If file doesn't exist or isn't readable
+    """
     if not os.path.isfile(filepath):
-        print(f"Error: {file_description} not found: {filepath}", file=sys.stderr)
-        sys.exit(1)
+        raise ValidationError(f"{file_description} not found: {filepath}")
     if not os.access(filepath, os.R_OK):
-        print(f"Error: {file_description} is not readable: {filepath}", file=sys.stderr)
-        sys.exit(1)
+        raise ValidationError(f"{file_description} is not readable: {filepath}")
 
 
 def validate_output_path(output_path):
-    """Validate that output directory exists or can be created."""
+    """Validate that output directory exists or can be created.
+
+    Args:
+        output_path (str): Path to the output file
+
+    Raises:
+        ValidationError: If output directory cannot be created
+    """
     output_dir = os.path.dirname(output_path)
     if output_dir and not os.path.exists(output_dir):
         try:
             os.makedirs(output_dir, exist_ok=True)
             print(f"Created output directory: {output_dir}")
         except OSError as e:
-            print(f"Error: Cannot create output directory {output_dir}: {e}", file=sys.stderr)
-            sys.exit(1)
+            raise ValidationError(f"Cannot create output directory {output_dir}: {e}")
+
+
+def validate_csv_columns(csv_path, required_columns, file_description):
+    """Validate that a CSV file contains all required columns.
+
+    Args:
+        csv_path (str): Path to the CSV file
+        required_columns (list): List of required column names
+        file_description (str): Human-readable description of the file
+
+    Raises:
+        DataLoadError: If any required columns are missing
+    """
+    csv_preview = pd.read_csv(csv_path, nrows=0)  # Read only header
+    missing_columns = [col for col in required_columns if col not in csv_preview.columns]
+    if missing_columns:
+        error_msg = f"{file_description} is missing required columns: {', '.join(missing_columns)}\n"
+        error_msg += f"Required columns: {', '.join(required_columns)}"
+        raise DataLoadError(error_msg)
 
 
 def extract_video_properties(video_path):
-    """Extract video properties using OpenCV."""
+    """Extract video properties using OpenCV.
+
+    Args:
+        video_path (str): Path to the video file
+
+    Returns:
+        tuple: (fps, width, height, num_frames)
+
+    Raises:
+        VideoError: If video file cannot be opened
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print(f"Error: Could not open video file: {video_path}", file=sys.stderr)
-        sys.exit(1)
+        raise VideoError(f"Could not open video file: {video_path}")
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -75,22 +122,12 @@ def main():
         description='Convert pixel coordinates from image tracking to world GPS coordinates.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # Basic usage
+Example:
   %(prog)s --image-tracks tracks.csv --drone-log drone.csv --video video.mp4 --output world_coords.csv
-
-  # With explicit video parameters (skips video reading)
-  %(prog)s --image-tracks tracks.csv --drone-log drone.csv \\
-           --fps 59.94 --width 2720 --height 1530 --frames 1137 \\
-           --output world_coords.csv
-
-  # Quiet mode (no progress output)
-  %(prog)s --image-tracks tracks.csv --drone-log drone.csv --video video.mp4 \\
-           --output world_coords.csv --quiet
 
 Notes:
   - The drone log file should be pre-filtered for the specific video timeframe
-  - Image tracks CSV should contain columns: id, x, y, frame, label
+  - All required columns will be validated before processing
   - Output will be written in CSV format with GPS coordinates
         """
     )
@@ -115,121 +152,63 @@ Notes:
         metavar='PATH',
         help='Path to output CSV file for world GPS coordinates'
     )
-
-    # Video input (mutually exclusive with explicit parameters)
-    video_group = parser.add_argument_group('video source')
-    video_mutex = video_group.add_mutually_exclusive_group(required=True)
-    video_mutex.add_argument(
+    required.add_argument(
         '--video',
+        required=True,
         metavar='PATH',
         help='Path to video file (properties will be extracted automatically)'
-    )
-    video_mutex.add_argument(
-        '--video-params',
-        action='store_true',
-        help='Use explicit video parameters instead of video file (requires --fps, --width, --height, --frames)'
-    )
-
-    # Explicit video parameters
-    params_group = parser.add_argument_group('explicit video parameters (requires --video-params)')
-    params_group.add_argument(
-        '--fps',
-        type=float,
-        metavar='FPS',
-        help='Video frames per second'
-    )
-    params_group.add_argument(
-        '--width',
-        type=int,
-        metavar='PIXELS',
-        help='Video frame width in pixels'
-    )
-    params_group.add_argument(
-        '--height',
-        type=int,
-        metavar='PIXELS',
-        help='Video frame height in pixels'
-    )
-    params_group.add_argument(
-        '--frames',
-        type=int,
-        metavar='COUNT',
-        help='Total number of frames in video'
-    )
-
-    # Optional arguments
-    parser.add_argument(
-        '--quiet', '-q',
-        action='store_true',
-        help='Suppress progress output'
-    )
-    parser.add_argument(
-        '--version',
-        action='version',
-        version='%(prog)s 1.0.0'
     )
 
     args = parser.parse_args()
 
-    # Validate input files
-    print("Validating input files...")
-    validate_file_exists(args.image_tracks, "Image tracks file")
-    validate_file_exists(args.drone_log, "Drone log file")
-
-    # Validate output path
-    validate_output_path(args.output)
-
-    # Get video parameters
-    if args.video:
+    try:
+        # Validate input files
+        print("Validating input files...")
+        validate_file_exists(args.image_tracks, "Image tracks file")
+        validate_file_exists(args.drone_log, "Drone log file")
         validate_file_exists(args.video, "Video file")
+
+        # Validate output path
+        validate_output_path(args.output)
+
+        # Get video parameters
         print(f"Extracting video properties from: {args.video}")
         video_fps, video_width, video_height, video_num_frames = extract_video_properties(args.video)
         print(f"  FPS: {video_fps}")
         print(f"  Resolution: {video_width}x{video_height}")
         print(f"  Frames: {video_num_frames}")
-    elif args.video_params:
-        # Validate that all required parameters are provided
-        if not all([args.fps, args.width, args.height, args.frames]):
-            parser.error("--video-params requires --fps, --width, --height, and --frames")
-        video_fps = args.fps
-        video_width = args.width
-        video_height = args.height
-        video_num_frames = args.frames
-        print(f"Using explicit video parameters:")
-        print(f"  FPS: {video_fps}")
-        print(f"  Resolution: {video_width}x{video_height}")
-        print(f"  Frames: {video_num_frames}")
 
-    # Load CSV files into DataFrames
-    print("\nLoading input files into memory...")
-    try:
-        image_tracks_df = pd.read_csv(args.image_tracks)
+        # Load CSV files into DataFrames
+        print("\nLoading input files into memory...")
+
+        # Validate required columns are present
+        validate_csv_columns(args.image_tracks, IMAGE_TRACKS_COLUMNS, "Image tracks file")
+        validate_csv_columns(args.drone_log, SENSOR_COLUMNS, "Drone log file")
+
+        # Load the actual data
+        image_tracks_df = pd.read_csv(args.image_tracks, usecols=IMAGE_TRACKS_COLUMNS)
         print(f"  Loaded {len(image_tracks_df)} image track records")
 
         sensor_data_df = pd.read_csv(args.drone_log, usecols=SENSOR_COLUMNS, dtype=float)
         print(f"  Loaded {len(sensor_data_df)} sensor records")
-        
-        # Defensive programming: verify all velocity measurements are present
-        velocity_columns = ['velocityX(mps)', 'velocityY(mps)', 'velocityZ(mps)']
+
+        # Verify all velocity measurements are populated with non-NaN values
+        velocity_columns = [col for col in SENSOR_COLUMNS if 'vel' in col.lower()]
         for col in velocity_columns:
             if sensor_data_df[col].isna().any():
                 missing_count = sensor_data_df[col].isna().sum()
-                print(f"\n❌ Error: Drone log contains {missing_count} missing values in {col}.", file=sys.stderr)
-                print(f"   All velocity measurements are required for GPS conversion.", file=sys.stderr)
-                sys.exit(1)
-                
-    except Exception as e:
-        print(f"\n❌ Failed to load input files: {e}", file=sys.stderr)
-        sys.exit(1)
+                raise DataLoadError(
+                    f"Drone log contains {missing_count} missing values in {col}. "
+                    f"All velocity measurements are required for GPS conversion."
+                )
 
-    # Run conversion
-    print("\nStarting GPS coordinate conversion...")
-    print(f"Input tracks: {args.image_tracks}")
-    print(f"Input drone log: {args.drone_log}")
-    print(f"Output: {args.output}")
-    print()
+        # Run conversion
+        print("\nStarting GPS coordinate conversion...")
+        print(f"Input tracks: {args.image_tracks}")
+        print(f"Input drone log: {args.drone_log}")
+        print(f"Output: {args.output}")
+        print()
 
-    try:
         trajectory_df = convert_pixel_to_world(
             image_tracks_df=image_tracks_df,
             sensor_data_df=sensor_data_df,
@@ -238,14 +217,17 @@ Notes:
             video_height=video_height,
             video_num_frames=video_num_frames
         )
-        
+
         # Save output to CSV
         print(f"\nSaving {len(trajectory_df)} trajectory records to CSV...")
         trajectory_df.to_csv(args.output, index=False)
-        
+
         print("✅ Conversion completed successfully!")
         print(f"Output written to: {args.output}")
 
+    except (ValidationError, VideoError, DataLoadError) as e:
+        print(f"\n❌ Error: {e}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f"\n❌ Conversion failed: {e}", file=sys.stderr)
         import traceback

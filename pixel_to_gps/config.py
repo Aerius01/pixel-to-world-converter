@@ -1,5 +1,20 @@
+"""Configuration constants for GPS converter."""
+
 import math
 import numpy as np
+
+# ============================================================
+# Required Input Data Columns
+# ============================================================
+SENSOR_COLUMNS = [
+    'time(millisecond)', 'latitude', 'longitude', 'altitude(m)',
+    'velocityX(mps)', 'velocityY(mps)', 'velocityZ(mps)',
+    'gimbalPitchRaw', 'gimbalRollRaw', 'gimbalYawRaw'
+]
+
+IMAGE_TRACKS_COLUMNS = [
+    'id', 'x', 'y', 'frame', 'label'
+]
 
 # ============================================================
 # Kalman Filter Parameters

@@ -1,9 +1,8 @@
-from fish_tracking.common.globals import *
-#from utils.common import *
-from fish_tracking.common.math_utils import *
-import math
-import copy
-import pandas as pd
+"""Pixel-to-world coordinate projection functions."""
+
+import numpy as np
+from ..config import MAX_VELOCITY
+
 
 def pixel_to_world_coordinates(pixel_pos, camera_extrinsics, K):
     """
@@ -84,7 +83,3 @@ def compute_world_velocity(current_position, last_position, time_per_frame_ms):
         current_velocity = (MAX_VELOCITY / velocity_magnitude) * current_velocity
 
     return current_velocity
-
-
-
-

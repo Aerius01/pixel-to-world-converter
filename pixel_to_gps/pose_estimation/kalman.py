@@ -1,4 +1,7 @@
+"""Kalman filter implementations for camera pose estimation."""
+
 import numpy as np
+
 
 class BaseKalmanFilter:
     """

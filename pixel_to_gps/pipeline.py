@@ -1,175 +1,23 @@
+"""Main GPS conversion pipeline orchestrating all processing stages."""
+
 import numpy as np
 import pandas as pd
 
-from fish_tracking.common.kalman_filter import StaticKalmanFilter
-from fish_tracking.common.globals import *
-from fish_tracking.pixel_to_world.rts_smoother import RTSSmoother
-from fish_tracking.pixel_to_world.trajectory_processor import TrajectoryProcessor
+from .config import (
+    KF_DOF, FOCAL_LENGTH, SENSOR_WIDTH,
+    GIMBAL_PITCH_OFFSET, CONVERSION_FACTOR
+)
+from .preprocessing import align_frames_to_sensors, get_velocity_enu, get_pose_gps
+from .pose_estimation import (
+    StaticKalmanFilter, RTSSmoother,
+    compute_extrinsic_matrix, compute_intrinsic_matrix
+)
+from .projection import (
+    TrajectoryProcessor,
+    prepare_pixel_tracks,
+    extract_species_label
+)
 
-from scipy.spatial.transform import Rotation as Rot
-import pymap3d as pm
-
-
-def compute_extrinsic_matrix(angles, camera_position):
-    """
-    Compute the extrinsic matrix from gimbal angles and camera position.
-    
-    Args:
-        angles (array-like): Gimbal angles in degrees where:
-            - angles[0]: roll
-            - angles[1]: pitch
-            - angles[2]: yaw
-        camera_position (array-like): Camera position [x, y, z] in meters
-    
-    Returns:
-        np.ndarray: 4x4 extrinsic matrix
-    """
-    rotation = Rot.from_euler('xyz', [np.deg2rad(angles[0]), np.deg2rad(angles[1]), -np.deg2rad(angles[2])])
-    rotation_matrix = rotation.as_matrix()
-    # center world coordinate system at initial drone pose
-    translation = np.array(camera_position).reshape(3, 1)
-    # Combine rotation_matrix and translation into a 3x4 matrix
-    rotation_translation = np.hstack((rotation_matrix, translation))
-    # Create the 4x4 extrinsic matrix
-    extrinsic = np.vstack((rotation_translation, [0, 0, 0, 1]))
-
-    return extrinsic
-
-
-def compute_intrinsic_matrix(focal_length, pixel_size, image_width, image_height):
-    """
-    Compute the camera intrinsic matrix that maps 3D camera coordinates to 2D pixel coordinates.
-
-    The intrinsic matrix encodes the camera's internal optical properties (lens and sensor),
-    independent of where the camera is positioned or pointing in the world.
-
-    Args:
-        focal_length (float): Physical focal length of the lens in meters
-        pixel_size (tuple): Physical size of one pixel (width, height) in meters
-        image_width (int): Image width in pixels
-        image_height (int): Image height in pixels
-
-    Returns:
-        np.ndarray: 3x3 intrinsic matrix K with structure:
-            [[f_x,   0, c_x],
-             [  0, f_y, c_y],
-             [  0,   0,   1]]
-
-            where:
-            - f_x, f_y: focal lengths in pixel units (controls zoom/magnification)
-            - c_x, c_y: principal point (where optical axis hits image plane)
-            - zeros: no skew between pixel axes (pixels are rectangular)
-            - 1: homogeneous coordinate for projection math
-    """
-    # Convert focal length from physical units (meters) to pixel units
-    # This tells us how many pixels correspond to the camera's focal length
-    f_x = focal_length / pixel_size[0]  # Horizontal focal length in pixels
-    f_y = focal_length / pixel_size[1]  # Vertical focal length in pixels
-
-    # The principal point is where the camera's optical axis intersects the image plane.
-    # For most cameras, this is very close to the image center.
-    c_x = image_width / 2   # Horizontal center
-    c_y = image_height / 2  # Vertical center
-
-    # Construct the 3x3 intrinsic matrix K
-    # This matrix is used in the pinhole camera model to project 3D points to 2D pixels
-    K = np.array([
-        [f_x, 0, c_x],  # Row 1: x-axis scaling and offset
-        [0, f_y, c_y],  # Row 2: y-axis scaling and offset
-        [0, 0, 1]       # Row 3: homogeneous coordinates
-    ])
-
-    return K
-
-
-def get_velocity_enu(sensor_df, idx):
-    """
-    Get drone velocity at specified index, converted from NED to ENU coordinate system.
-    
-    The drone's IMU reports velocity in NED (North-East-Down) coordinates, which we
-    convert to ENU (East-North-Up) for consistency with the world coordinate system.
-    
-    NED to ENU conversion:
-    - X: North → East (negated)
-    - Y: East → North (unchanged) 
-    - Z: Down → Up (negated)
-
-    Args:
-        sensor_df (pd.DataFrame): Sensor data DataFrame with velocity columns
-        idx (int): Index of the sensor measurement to retrieve
-
-    Returns:
-        np.array: Velocity vector [x, y, z] in m/s (ENU coordinates)
-    """
-    return np.array([
-        -sensor_df.iloc[idx]['velocityX(mps)'],   # North → East (negated)
-        sensor_df.iloc[idx]['velocityY(mps)'],     # East → North
-        -sensor_df.iloc[idx]['velocityZ(mps)']     # Down → Up (negated)
-    ])
-
-
-def get_pose_gps(sensor_df):
-    """
-    Convert GPS positions to local ENU coordinates relative to first position.
-    
-    Args:
-        sensor_df (pd.DataFrame): Sensor data with latitude, longitude, altitude columns
-        
-    Returns:
-        list: List of [east, north, up] positions in meters relative to first GPS position
-    """
-    pose_gps = []
-
-    for i in range(len(sensor_df)):
-        lat = sensor_df.iloc[i]['latitude']
-        lon = sensor_df.iloc[i]['longitude']
-        alt = sensor_df.iloc[i]['altitude(m)']
-
-        # Convert to ENU coordinates relative to reference (first GPS position)
-        # Reference altitude at sea level == 0
-        # This call converts from geodetic (latitude, longitude, altitude) to local ENU (north, east, up) coordinates (in meters).
-        enu_coords = pm.geodetic2enu(lat, lon, alt, sensor_df.iloc[0]['latitude'], sensor_df.iloc[0]['longitude'], 0,
-                              ell=pm.Ellipsoid.from_name("wgs84"), deg=True)
-
-        # Reorder to [east, north, up] and flip Z-axis
-        pose_gps.append([enu_coords[1], enu_coords[0], -enu_coords[2]])
-
-    return pose_gps
-
-def prepare_pixel_tracks(target_df: pd.DataFrame):
-    """Prepare pixel track data for world coordinate conversion.
-
-    Args:
-        target_df: DataFrame already filtered to a single target_id with columns: id, x, y, frame, label
-
-    Returns:
-        tracks_df: DataFrame with columns x, y, frame (one row per detection)
-    """
-    # Return DataFrame with only the columns needed for tracking
-    # Round x, y to integers to match original Particle class behavior
-    tracks_df = target_df[['x', 'y', 'frame']].copy()
-    tracks_df['x'] = tracks_df['x'].round().astype(int)
-    tracks_df['y'] = tracks_df['y'].round().astype(int)
-    tracks_df['frame'] = tracks_df['frame'].astype(int)
-
-    return tracks_df
-
-
-def extract_species_label(target_rows: pd.DataFrame) -> str:
-    """
-    Extract species label from target rows using majority voting.
-    
-    Args:
-        target_rows: DataFrame rows for a single target
-        
-    Returns:
-        str: Species label (most common label, or "Unknown" if unavailable)
-    """
-    if 'label' not in target_rows.columns or len(target_rows) == 0:
-        return "Unknown"
-    
-    mode_result = target_rows['label'].mode()
-    return mode_result.iloc[0] if len(mode_result) > 0 else "Unknown"
 
 def convert_pixel_to_world(
     image_tracks_df: pd.DataFrame,
@@ -186,13 +34,12 @@ def convert_pixel_to_world(
             id, x, y, frame, label
         sensor_data_df (pd.DataFrame): DataFrame containing preprocessed drone sensor data with columns:
             time(millisecond), latitude, longitude, altitude(m), velocityX(mps), velocityY(mps),
-            velocityZ(mps), pitch(deg), roll(deg), yaw(deg), isTakingVideo, gimbalPitchRaw,
-            gimbalRollRaw, gimbalYawRaw
+            velocityZ(mps), gimbalPitchRaw, gimbalRollRaw, gimbalYawRaw
         video_fps (float): Video frames per second
         video_width (int): Video frame width in pixels
         video_height (int): Video frame height in pixels
         video_num_frames (int): Total number of frames in video
-        
+
     Returns:
         pd.DataFrame: World trajectory data with GPS coordinates
     """
@@ -204,16 +51,9 @@ def convert_pixel_to_world(
     # ============================================================
     # SECTION 1: Process drone sensor data
     # ============================================================
-    # Create time arrays for frames and sensor measurements
-    frame_duration = 1.0 / video_fps # Time between frames
-    frame_times = np.arange(video_num_frames) * frame_duration
-    sensor_times = (sensor_data_df['time(millisecond)'].values - sensor_data_df['time(millisecond)'].iloc[0]) / 1000  # Convert to seconds
-    
-    # For each frame, find the sensor data row with the closest timestamp
-    frame_to_sensor_idx = np.array([
-        np.argmin(np.abs(sensor_times - frame_time)) 
-        for frame_time in frame_times
-    ])
+    frame_times, sensor_times, frame_to_sensor_idx = align_frames_to_sensors(
+        video_fps, video_num_frames, sensor_data_df
+    )
 
     # ============================================================
     # SECTION 2: Forward Kalman filter for camera pose estimation
@@ -243,8 +83,9 @@ def convert_pixel_to_world(
     # The noise matrices were changed to their current static forms during the port from C++ to python.
     # The static noise matrices date back to Pia's ported implementation
     # The redundant Kalman filter and dates back to the C++ implementation
-    
+
     # Initialize Kalman filter with constant noise matrices (matching original implementation)
+    frame_duration = 1.0 / video_fps
     for k in range(video_num_frames):
         # Get the sensor data row index for this frame using pre-computed mapping
         current_time = frame_times[k]
@@ -272,7 +113,7 @@ def convert_pixel_to_world(
                 # Combine position and velocity measurements
                 measurement = np.concatenate((drone_positions_gps[mapped_sensor_idx], current_velocity))
                 kalman_filter.update(measurement)
-        
+
         # Extract state and covariance after initialization/update
         filtered_state = kalman_filter.state
         filtered_variance = kalman_filter.P
@@ -287,9 +128,9 @@ def convert_pixel_to_world(
     # SECTION 3: RTS backward smoother for improved estimates
     # ============================================================
     # The RTS smoother operates on a data set already smoothed by the Kalman filter
-    # and refines the estimates by making a backward pass through it. Passively, 
-    # it leverages the full dataset since it's operating on calculated values that 
-    # have already considered all the values that came before them (and therefore 
+    # and refines the estimates by making a backward pass through it. Passively,
+    # it leverages the full dataset since it's operating on calculated values that
+    # have already considered all the values that came before them (and therefore
     # incorporates 'future knowledge')
     rts_smoothed_positions = np.zeros((video_num_frames, 3))
 
