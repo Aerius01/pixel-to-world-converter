@@ -95,10 +95,20 @@ id,x,y,frame,label
 
 ### Sensor Log CSV
 Must contain columns as defined in `DRONE_LOG_SCHEMA`:
+- Timestamp: `time(millisecond)`
 - GPS: `latitude`, `longitude`, `altitude(m)`
-- IMU: `velocityX(mps)`, `velocityY(mps)`, `velocityZ(mps)` (NED frame)
-- Gimbal: `gimbalRollRaw`, `gimbalPitchRaw`, `gimbalYawRaw`
-- Timestamp: `datetime(utc)`
+- IMU: `velocityX(mps)`, `velocityY(mps)`, `velocityZ(mps)` (NED frame) - **all rows must contain valid velocity values for Kalman filtering**
+- Gimbal: `gimbalPitchRaw`, `gimbalRollRaw`, `gimbalYawRaw` (raw values are divided by `CONVERSION_FACTOR` during processing; default is 10.0, meaning gimbal angles are expected to be 10x their normal 360° values)
+
+**⚠️ Important:** The sensor log must be filtered to exactly match the video duration. It is assumed that frame 0 in `image_tracks` corresponds to row 0 in the sensor log (regardless as to the value of the 'time(millisecond)' column), and then subsequent frames are matched to associated sensor log rows based on the video fps and the row time(millisecond) value. Trim your sensor log to start at the video start time and end at the video end time.
+
+```csv
+time(millisecond),latitude,longitude,altitude(m),velocityX(mps),velocityY(mps),velocityZ(mps),gimbalPitchRaw,gimbalRollRaw,gimbalYawRaw
+218095,23.999021,-111.539293,19.6,-4.3,2.0,0.0,-899,0,-237
+218196,23.999018,-111.539291,19.6,-4.5,2.1,0.0,-899,0,-237
+218295,23.999014,-111.539289,19.6,-4.6,2.1,0.0,-899,1,-237
+218382,23.999009,-111.539287,19.6,-4.6,2.1,0.0,-900,0,-237
+```
 
 DJI flight logs typically contain all required fields.
 
@@ -114,8 +124,11 @@ KF_INITIAL_COVARIANCE_SCALE = 1.0   # Initial state uncertainty
 
 # Camera Parameters
 FOCAL_LENGTH = 0.0088               # meters
-SENSOR_WIDTH = 0.01276              # meters (DJI Mavic 3)
-GIMBAL_PITCH_OFFSET = 0.03665191    # radians (90° - actual)
+SENSOR_WIDTH = 0.0132               # meters (DJI sensor width)
+
+# Gimbal Parameters
+GIMBAL_PITCH_OFFSET = -math.pi / 2.0  # Gimbal pitch offset to correct reference frame
+CONVERSION_FACTOR = 10.0              # Converting raw gimbal angles to real angles
 ```
 
 ## Output Format
@@ -129,6 +142,8 @@ The output DataFrame contains smoothed world trajectories with the following col
 | `avg_vel_x` | Velocity in m/s (East direction) |
 | `avg_vel_y` | Velocity in m/s (North direction) |
 | `avg_vel` | Speed in m/s (magnitude) |
+| `avg_pixel_pos_x` | Original pixel x-coordinate |
+| `avg_pixel_pos_y` | Original pixel y-coordinate |
 | `angle` | Heading in degrees (0=East, 90=North) |
 | `frame` | Video frame number |
 | `target_id` | Tracked object ID |
@@ -145,7 +160,7 @@ The output DataFrame contains smoothed world trajectories with the following col
 
 ## API Reference
 
-### Main Functions
+### Sole Function
 
 #### `convert(image_tracks_csv, video_path, sensor_log_path)`
 High-level function that handles file loading and validation.
@@ -154,18 +169,6 @@ High-level function that handles file loading and validation.
 - `image_tracks_csv`: Path to CSV or DataFrame with pixel tracks
 - `video_path`: Path to video file (for extracting fps, dimensions)
 - `sensor_log_path`: Path to sensor log CSV
-
-**Returns:** DataFrame with world trajectory data
-
-#### `convert_pixel_to_world(image_tracks_df, sensor_data_df, video_fps, video_width, video_height, video_num_frames)`
-Low-level pipeline function for direct data processing.
-
-**Parameters:**
-- `image_tracks_df`: DataFrame with pixel coordinates
-- `sensor_data_df`: DataFrame with sensor measurements
-- `video_fps`: Frame rate (float)
-- `video_width`, `video_height`: Video dimensions (int)
-- `video_num_frames`: Total frame count (int)
 
 **Returns:** DataFrame with world trajectory data
 
