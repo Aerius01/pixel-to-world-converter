@@ -74,3 +74,4 @@ dmypy.json
 *.mov
 output/
 data/
+testing/
