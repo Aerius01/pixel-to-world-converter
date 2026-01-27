@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-GPS Coordinate Converter for Fish Tracking
+Convert pixel coordinates from image-based object tracking to world GPS coordinates.
 
-Converts pixel coordinates from image tracking to world GPS coordinates using
-drone sensor data (GPS, IMU, gimbal orientation).
+This script serves as the main entry point for the GPS converter pipeline. It:
+1. Validates input files and their schemas
+2. Extracts video properties (FPS, dimensions)
+3. Orchestrates the conversion pipeline
+4. Outputs world trajectory data in CSV format
 
-Usage:
-    python convert_tracks_to_gps.py \
-        --image-tracks path/to/image_tracks.csv \
-        --drone-log path/to/drone_log.csv \
-        --video path/to/video.mp4 \
-        --output path/to/output.csv
+The conversion process transforms 2D pixel coordinates from drone video frames into
+3D world coordinates (ENU system) using camera pose estimation and ray-plane intersection.
 """
 
 import argparse
@@ -24,29 +23,30 @@ from pixel_to_gps.schema import DRONE_LOG_SCHEMA, IMAGE_TRACKS_SCHEMA
 
 
 class ValidationError(Exception):
-    """Raised when input validation fails."""
+    """Raised when input file validation fails (missing files, permissions, etc.)."""
     pass
 
 
 class VideoError(Exception):
-    """Raised when video file cannot be processed."""
+    """Raised when video file cannot be opened or read."""
     pass
 
 
 class DataLoadError(Exception):
-    """Raised when CSV data cannot be loaded or is invalid."""
+    """Raised when CSV data is missing required columns or contains invalid values."""
     pass
 
 
 def validate_file_exists(filepath, file_description):
-    """Validate that a file exists and is readable.
+    """
+    Verify that a file exists and is readable.
 
     Args:
-        filepath (str): Path to the file to validate
-        file_description (str): Human-readable description of the file
+        filepath: Path to the file to validate
+        file_description: Human-readable description for error messages
 
     Raises:
-        ValidationError: If file doesn't exist or isn't readable
+        ValidationError: If file does not exist or is not readable
     """
     if not os.path.isfile(filepath):
         raise ValidationError(f"{file_description} not found: {filepath}")
@@ -55,35 +55,39 @@ def validate_file_exists(filepath, file_description):
 
 
 def validate_output_path(output_path):
-    """Validate that output directory exists or can be created.
+    """
+    Ensure the output directory exists, creating it if necessary.
 
     Args:
-        output_path (str): Path to the output file
+        output_path: Full path where output file will be written
 
     Raises:
-        ValidationError: If output directory cannot be created
+        ValidationError: If directory cannot be created due to permissions or other OS errors
     """
     output_dir = os.path.dirname(output_path)
     if output_dir and not os.path.exists(output_dir):
         try:
             os.makedirs(output_dir, exist_ok=True)
-            print(f"Created output directory: {output_dir}")
         except OSError as e:
             raise ValidationError(f"Cannot create output directory {output_dir}: {e}")
 
 
 def validate_csv_schema(csv_path, schema, file_description):
-    """Validate that a CSV file matches the expected schema.
+    """
+    Validate that a CSV file contains all required columns.
+
+    This function reads only the header row (nrows=0) for efficiency, then checks
+    for the presence of all required columns defined in the schema.
 
     Args:
-        csv_path (str): Path to the CSV file
-        schema: Schema object with validate() method
-        file_description (str): Human-readable description of the file
+        csv_path: Path to the CSV file to validate
+        schema: Schema object with validate() and get_required_columns() methods
+        file_description: Human-readable description for error messages
 
     Raises:
-        DataLoadError: If schema validation fails
+        DataLoadError: If required columns are missing from the CSV
     """
-    csv_preview = pd.read_csv(csv_path, nrows=0)  # Read only header
+    csv_preview = pd.read_csv(csv_path, nrows=0)
     missing_columns = schema.validate(csv_preview)
     if missing_columns:
         error_msg = f"{file_description} is missing required columns: {', '.join(missing_columns)}\n"
@@ -92,16 +96,25 @@ def validate_csv_schema(csv_path, schema, file_description):
 
 
 def extract_video_properties(video_path):
-    """Extract video properties using OpenCV.
+    """
+    Extract essential properties from a video file using OpenCV.
+
+    Opens the video file and reads metadata properties required for the GPS conversion
+    pipeline: frame rate, dimensions, and total frame count. The video is immediately
+    closed after reading properties to free resources.
 
     Args:
-        video_path (str): Path to the video file
+        video_path: Path to the video file
 
     Returns:
         tuple: (fps, width, height, num_frames)
+            - fps (float): Frames per second
+            - width (int): Frame width in pixels
+            - height (int): Frame height in pixels
+            - num_frames (int): Total number of frames in the video
 
     Raises:
-        VideoError: If video file cannot be opened
+        VideoError: If video file cannot be opened by OpenCV
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -118,6 +131,12 @@ def extract_video_properties(video_path):
 
 
 def main():
+    """
+    Main entry point for GPS conversion pipeline.
+
+    Parses command-line arguments, validates inputs, extracts video properties,
+    and orchestrates the full pixel-to-world conversion pipeline.
+    """
     parser = argparse.ArgumentParser(
         description='Convert pixel coordinates from image tracking to world GPS coordinates.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -162,37 +181,42 @@ Notes:
     args = parser.parse_args()
 
     try:
-        # Validate input files
-        print("Validating input files...")
+        print("=" * 80)
+        print("GPS CONVERTER - Pixel to World Coordinate Transformation")
+        print("=" * 80)
+
+        # Step 1: Validate input files
+        print("\n[1/6] Validating input files...")
         validate_file_exists(args.image_tracks, "Image tracks file")
         validate_file_exists(args.drone_log, "Drone log file")
         validate_file_exists(args.video, "Video file")
-
-        # Validate output path
         validate_output_path(args.output)
+        print("      All input files validated successfully")
 
-        # Get video parameters
-        print(f"Extracting video properties from: {args.video}")
+        # Step 2: Extract video properties
+        print("\n[2/6] Extracting video properties...")
         video_fps, video_width, video_height, video_num_frames = extract_video_properties(args.video)
-        print(f"  FPS: {video_fps}")
-        print(f"  Resolution: {video_width}x{video_height}")
-        print(f"  Frames: {video_num_frames}")
+        print(f"      Video: {video_width}x{video_height} @ {video_fps:.2f} fps ({video_num_frames} frames)")
 
-        # Load CSV files into DataFrames
-        print("\nLoading input files into memory...")
-
-        # Validate schemas
+        # Step 3: Validate CSV schemas
+        print("\n[3/6] Validating CSV schemas...")
         validate_csv_schema(args.image_tracks, IMAGE_TRACKS_SCHEMA, "Image tracks file")
         validate_csv_schema(args.drone_log, DRONE_LOG_SCHEMA, "Drone log file")
+        print("      All required columns present")
 
-        # Load the actual data
+        # Step 4: Load data
+        print("\n[4/6] Loading CSV data...")
         image_tracks_df = pd.read_csv(args.image_tracks, usecols=IMAGE_TRACKS_SCHEMA.get_required_columns())
-        print(f"  Loaded {len(image_tracks_df)} image track records")
-
         sensor_data_df = pd.read_csv(args.drone_log, usecols=DRONE_LOG_SCHEMA.get_required_columns(), dtype=float)
-        print(f"  Loaded {len(sensor_data_df)} sensor records")
 
-        # Verify all velocity measurements are populated with non-NaN values
+        num_tracks = len(image_tracks_df)
+        num_targets = image_tracks_df['id'].nunique()
+        num_sensor_records = len(sensor_data_df)
+        print(f"      Loaded {num_tracks} detections across {num_targets} targets")
+        print(f"      Loaded {num_sensor_records} sensor records")
+
+        # Step 5: Validate velocity data (required for Kalman filter)
+        print("\n[5/6] Validating sensor data completeness...")
         velocity_columns = [DRONE_LOG_SCHEMA.vel_x_col, DRONE_LOG_SCHEMA.vel_y_col, DRONE_LOG_SCHEMA.vel_z_col]
         for col in velocity_columns:
             if sensor_data_df[col].isna().any():
@@ -201,14 +225,11 @@ Notes:
                     f"Drone log contains {missing_count} missing values in {col}. "
                     f"All velocity measurements are required for GPS conversion."
                 )
+        print("      All velocity measurements present (required for Kalman filter)")
 
-        # Run conversion
-        print("\nStarting GPS coordinate conversion...")
-        print(f"Input tracks: {args.image_tracks}")
-        print(f"Input drone log: {args.drone_log}")
-        print(f"Output: {args.output}")
-        print()
-
+        # Step 6: Run conversion pipeline
+        print("\n[6/6] Running GPS conversion pipeline...")
+        print("      This may take a few minutes depending on video length...")
         trajectory_df = convert_pixel_to_world(
             image_tracks_df=image_tracks_df,
             sensor_data_df=sensor_data_df,
@@ -218,18 +239,20 @@ Notes:
             video_num_frames=video_num_frames
         )
 
-        # Save output to CSV
-        print(f"\nSaving {len(trajectory_df)} trajectory records to CSV...")
+        # Save output
         trajectory_df.to_csv(args.output, index=False)
+        num_trajectory_records = len(trajectory_df)
+        print(f"      Conversion complete! Generated {num_trajectory_records} trajectory records")
 
-        print("✅ Conversion completed successfully!")
-        print(f"Output written to: {args.output}")
+        print(f"\n{'=' * 80}")
+        print(f"SUCCESS: Output written to {args.output}")
+        print(f"{'=' * 80}\n")
 
     except (ValidationError, VideoError, DataLoadError) as e:
-        print(f"\n❌ Error: {e}", file=sys.stderr)
+        print(f"\nERROR: {e}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Conversion failed: {e}", file=sys.stderr)
+        print(f"\nUNEXPECTED ERROR:", file=sys.stderr)
         import traceback
         traceback.print_exc()
         sys.exit(1)

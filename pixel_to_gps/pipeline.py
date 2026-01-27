@@ -1,4 +1,19 @@
-"""Main GPS conversion pipeline orchestrating all processing stages."""
+"""
+GPS conversion pipeline orchestration.
+
+This module implements the main 5-stage pipeline for converting pixel coordinates
+from drone video tracking to world GPS coordinates:
+
+1. Sensor Alignment: Map video frames to nearest sensor timestamps
+2. Forward Kalman Filter: Estimate camera pose (position + velocity) from GPS/IMU
+3. RTS Smoother: Refine pose estimates using backward pass
+4. Camera Extrinsics: Compute transformation matrices from gimbal angles
+5. Pixel-to-World Projection: Convert pixel coords to GPS via ray-plane intersection
+
+The pipeline operates in the ENU (East-North-Up) coordinate system with the first
+GPS position as the origin. All existing comments in convert_pixel_to_world()
+preserve important implementation details and should not be modified.
+"""
 
 import numpy as np
 import pandas as pd
@@ -28,26 +43,43 @@ def convert_pixel_to_world(
     video_height: int,
     video_num_frames: int
 ):
-    """Convert pixel coordinates from image tracks to world GPS coordinates.
+    """
+    Convert pixel coordinates from image tracking to world GPS coordinates.
+
+    This is the main pipeline function that orchestrates the 5-stage conversion process.
+    It transforms 2D pixel coordinates into 3D world positions (ENU coordinate system)
+    by combining drone sensor data (GPS, IMU, gimbal) with camera geometry.
+
+    Pipeline Stages:
+        1. Align video frame times with sensor timestamps
+        2. Estimate camera pose using forward Kalman filter
+        3. Refine estimates using backward RTS smoother
+        4. Compute camera extrinsic matrices from gimbal angles
+        5. Project pixel coordinates to world using ray-plane intersection
 
     Args:
-        image_tracks_df (pd.DataFrame): DataFrame containing pixel coordinates with columns:
-            id, x, y, frame, label
-        sensor_data_df (pd.DataFrame): DataFrame containing preprocessed drone sensor data with columns:
-            time(millisecond), latitude, longitude, altitude(m), velocityX(mps), velocityY(mps),
-            velocityZ(mps), gimbalPitchRaw, gimbalRollRaw, gimbalYawRaw
-        video_fps (float): Video frames per second
-        video_width (int): Video frame width in pixels
-        video_height (int): Video frame height in pixels
-        video_num_frames (int): Total number of frames in video
+        image_tracks_df: DataFrame with columns [id, x, y, frame, label]
+                        containing pixel coordinates of tracked objects
+        sensor_data_df: DataFrame with GPS, IMU, and gimbal data
+                       (see DRONE_LOG_SCHEMA for required columns)
+        video_fps: Video frame rate (frames per second)
+        video_width: Video frame width in pixels
+        video_height: Video frame height in pixels
+        video_num_frames: Total number of frames in video
 
     Returns:
-        pd.DataFrame: World trajectory data with GPS coordinates
-    """
+        DataFrame with world trajectory data containing:
+        - avg_pos_x, avg_pos_y: Smoothed world position in meters (ENU)
+        - avg_vel_x, avg_vel_y, avg_vel: Smoothed velocity in m/s
+        - angle: Heading in degrees (0=East, 90=North)
+        - frame, target_id, species_label: Tracking metadata
+        - ref_latitude, ref_longitude, ref_altitude: GPS reference point
 
-    # This function assumes that:
-    # - The sensor data is pre-filtered for the specific video
-    # - Each row of the sensor data contains all velocity measurements
+    Coordinate Systems:
+        - Input velocities: NED (North-East-Down) from drone IMU
+        - Processing: ENU (East-North-Up) with origin at first GPS position
+        - Output: ENU coordinates in meters relative to reference GPS point
+    """
 
     # ============================================================
     # SECTION 1: Process drone sensor data
