@@ -8,9 +8,10 @@ extraction, and orchestrates the conversion pipeline.
 
 import os
 import cv2
+import numpy as np
 import pandas as pd
 
-from .pipeline import convert_pixel_to_world
+from .pipeline import convert_pixel_to_world, build_frame_homographies
 from .schema import DRONE_LOG_SCHEMA, IMAGE_TRACKS_SCHEMA
 
 
@@ -254,3 +255,69 @@ def convert(
     log(f"{'=' * 80}\n")
 
     return trajectory_df
+
+
+def compute_homographies(
+    drone_log_path: str,
+    video_path: str,
+    ground_z: float = 0.0,
+) -> np.ndarray:
+    """
+    Precompute ground-plane homographies for every frame of a drone video.
+
+    Validates inputs, extracts video properties, and runs the pose estimation
+    pipeline (sensor alignment, Kalman filter, RTS smoother, camera extrinsics)
+    to produce one 3x3 homography per frame. Apply the result with project_bbox()
+    for ad-hoc bounding box projection at inference time.
+
+    Args:
+        drone_log_path: Path to pre-filtered drone sensor data CSV file
+        video_path: Path to video file (for extracting FPS and dimensions)
+        ground_z: Altitude of the ground plane in meters (default 0.0 = sea level)
+
+    Returns:
+        ndarray of shape (num_frames, 3, 3) — one homography per frame
+
+    Raises:
+        ValidationError: If input files don't exist or aren't readable
+        VideoError: If video file cannot be opened
+        DataLoadError: If CSV file is missing required columns or contains invalid data
+        PixelToWorldError: For other conversion-related errors
+
+    Example:
+        >>> from pixel_to_world_converter import compute_homographies, project_bbox
+        >>> H = compute_homographies('drone.csv', 'video.mp4')
+        >>> corners = project_bbox(cx, cy, w, h, H[frame_id])
+    """
+    validate_file_exists(drone_log_path, "Drone log file")
+    validate_file_exists(video_path, "Video file")
+
+    video_fps, video_width, video_height, video_num_frames = extract_video_properties(video_path)
+
+    validate_csv_schema(drone_log_path, DRONE_LOG_SCHEMA, "Drone log file")
+
+    try:
+        sensor_data_df = pd.read_csv(drone_log_path, usecols=DRONE_LOG_SCHEMA.get_required_columns(), dtype=float)
+    except Exception as e:
+        raise DataLoadError(f"Failed to load drone log CSV: {e}")
+
+    velocity_columns = [DRONE_LOG_SCHEMA.vel_x_col, DRONE_LOG_SCHEMA.vel_y_col, DRONE_LOG_SCHEMA.vel_z_col]
+    for col in velocity_columns:
+        if sensor_data_df[col].isna().any():
+            missing_count = sensor_data_df[col].isna().sum()
+            raise DataLoadError(
+                f"Drone log contains {missing_count} missing values in {col}. "
+                f"All velocity measurements are required for GPS conversion."
+            )
+
+    try:
+        return build_frame_homographies(
+            sensor_data_df=sensor_data_df,
+            video_fps=video_fps,
+            video_width=video_width,
+            video_height=video_height,
+            video_num_frames=video_num_frames,
+            ground_z=ground_z,
+        )
+    except Exception as e:
+        raise PixelToWorldError(f"Homography pipeline failed: {e}")
