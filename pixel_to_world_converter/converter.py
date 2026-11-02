@@ -11,28 +11,8 @@ import cv2
 import numpy as np
 import pandas as pd
 
+from .errors import DataLoadError, PixelToWorldError, ValidationError, VideoError
 from .pipeline import convert_pixel_to_world, build_frame_homographies
-from .schema import DRONE_LOG_SCHEMA, IMAGE_TRACKS_SCHEMA
-
-
-class PixelToWorldError(Exception):
-    """Base exception for all pixel-to-world conversion errors."""
-    pass
-
-
-class ValidationError(PixelToWorldError):
-    """Raised when input file validation fails (missing files, permissions, etc.)."""
-    pass
-
-
-class VideoError(PixelToWorldError):
-    """Raised when video file cannot be opened or read."""
-    pass
-
-
-class DataLoadError(PixelToWorldError):
-    """Raised when CSV data is missing required columns or contains invalid values."""
-    pass
 
 
 def validate_file_exists(filepath, file_description):
@@ -68,29 +48,6 @@ def validate_output_path(output_path):
             os.makedirs(output_dir, exist_ok=True)
         except OSError as e:
             raise ValidationError(f"Cannot create output directory {output_dir}: {e}")
-
-
-def validate_csv_schema(csv_path, schema, file_description):
-    """
-    Validate that a CSV file contains all required columns.
-
-    This function reads only the header row (nrows=0) for efficiency, then checks
-    for the presence of all required columns defined in the schema.
-
-    Args:
-        csv_path: Path to the CSV file to validate
-        schema: Schema object with validate() and get_required_columns() methods
-        file_description: Human-readable description for error messages
-
-    Raises:
-        DataLoadError: If required columns are missing from the CSV
-    """
-    csv_preview = pd.read_csv(csv_path, nrows=0)
-    missing_columns = schema.validate(csv_preview)
-    if missing_columns:
-        error_msg = f"{file_description} is missing required columns: {', '.join(missing_columns)}\n"
-        error_msg += f"Required columns: {', '.join(schema.get_required_columns())}"
-        raise DataLoadError(error_msg)
 
 
 def extract_video_properties(video_path):
@@ -178,7 +135,7 @@ def convert(
     log("=" * 80)
 
     # Step 1: Validate input files
-    log("\n[1/6] Validating input files...")
+    log("\n[1/4] Validating input files...")
     validate_file_exists(image_tracks_path, "Image tracks file")
     validate_file_exists(drone_log_path, "Drone log file")
     validate_file_exists(video_path, "Video file")
@@ -186,48 +143,18 @@ def convert(
     log("      All input files validated successfully")
 
     # Step 2: Extract video properties
-    log("\n[2/6] Extracting video properties...")
+    log("\n[2/4] Extracting video properties...")
     video_fps, video_width, video_height, video_num_frames = extract_video_properties(video_path)
     log(f"      Video: {video_width}x{video_height} @ {video_fps:.2f} fps ({video_num_frames} frames)")
 
-    # Step 3: Validate CSV schemas
-    log("\n[3/6] Validating CSV schemas...")
-    validate_csv_schema(image_tracks_path, IMAGE_TRACKS_SCHEMA, "Image tracks file")
-    validate_csv_schema(drone_log_path, DRONE_LOG_SCHEMA, "Drone log file")
-    log("      All required columns present")
+    # Step 3: Load data
+    log("\n[3/4] Loading CSV data...")
+    image_tracks_df = _read_csv(image_tracks_path, "image tracks")
+    sensor_data_df = _read_csv(drone_log_path, "drone log")
+    log(f"      Loaded {len(image_tracks_df)} detections and {len(sensor_data_df)} sensor records")
 
-    # Step 4: Load data
-    log("\n[4/6] Loading CSV data...")
-    try:
-        image_tracks_df = pd.read_csv(image_tracks_path, usecols=IMAGE_TRACKS_SCHEMA.get_required_columns())
-    except Exception as e:
-        raise DataLoadError(f"Failed to load image tracks CSV: {e}")
-    
-    try:
-        sensor_data_df = pd.read_csv(drone_log_path, usecols=DRONE_LOG_SCHEMA.get_required_columns(), dtype=float)
-    except Exception as e:
-        raise DataLoadError(f"Failed to load drone log CSV: {e}")
-
-    num_tracks = len(image_tracks_df)
-    num_targets = image_tracks_df['id'].nunique()
-    num_sensor_records = len(sensor_data_df)
-    log(f"      Loaded {num_tracks} detections across {num_targets} targets")
-    log(f"      Loaded {num_sensor_records} sensor records")
-
-    # Step 5: Validate velocity data (required for Kalman filter)
-    log("\n[5/6] Validating sensor data completeness...")
-    velocity_columns = [DRONE_LOG_SCHEMA.vel_x_col, DRONE_LOG_SCHEMA.vel_y_col, DRONE_LOG_SCHEMA.vel_z_col]
-    for col in velocity_columns:
-        if sensor_data_df[col].isna().any():
-            missing_count = sensor_data_df[col].isna().sum()
-            raise DataLoadError(
-                f"Drone log contains {missing_count} missing values in {col}. "
-                f"All velocity measurements are required for GPS conversion."
-            )
-    log("      All velocity measurements present (required for Kalman filter)")
-
-    # Step 6: Run conversion pipeline
-    log("\n[6/6] Running GPS conversion pipeline...")
+    # Step 4: Validate the tables and run the conversion pipeline
+    log("\n[4/4] Running GPS conversion pipeline...")
     log("      This may take a few minutes depending on video length...")
     try:
         trajectory_df = convert_pixel_to_world(
@@ -238,6 +165,8 @@ def convert(
             video_height=video_height,
             video_num_frames=video_num_frames
         )
+    except PixelToWorldError:
+        raise
     except Exception as e:
         raise PixelToWorldError(f"Pipeline conversion failed: {e}")
 
@@ -294,21 +223,7 @@ def compute_homographies(
 
     video_fps, video_width, video_height, video_num_frames = extract_video_properties(video_path)
 
-    validate_csv_schema(drone_log_path, DRONE_LOG_SCHEMA, "Drone log file")
-
-    try:
-        sensor_data_df = pd.read_csv(drone_log_path, usecols=DRONE_LOG_SCHEMA.get_required_columns(), dtype=float)
-    except Exception as e:
-        raise DataLoadError(f"Failed to load drone log CSV: {e}")
-
-    velocity_columns = [DRONE_LOG_SCHEMA.vel_x_col, DRONE_LOG_SCHEMA.vel_y_col, DRONE_LOG_SCHEMA.vel_z_col]
-    for col in velocity_columns:
-        if sensor_data_df[col].isna().any():
-            missing_count = sensor_data_df[col].isna().sum()
-            raise DataLoadError(
-                f"Drone log contains {missing_count} missing values in {col}. "
-                f"All velocity measurements are required for GPS conversion."
-            )
+    sensor_data_df = _read_csv(drone_log_path, "drone log")
 
     try:
         return build_frame_homographies(
@@ -319,5 +234,15 @@ def compute_homographies(
             video_num_frames=video_num_frames,
             ground_z=ground_z,
         )
+    except PixelToWorldError:
+        raise
     except Exception as e:
         raise PixelToWorldError(f"Homography pipeline failed: {e}")
+
+
+def _read_csv(csv_path, description):
+    """Read a CSV whole; its columns are checked by the pipeline function it is passed to."""
+    try:
+        return pd.read_csv(csv_path)
+    except Exception as e:
+        raise DataLoadError(f"Failed to load {description} CSV: {e}")

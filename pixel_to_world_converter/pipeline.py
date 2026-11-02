@@ -34,6 +34,7 @@ from .projection import (
     extract_species_label,
     compute_ground_homography,
 )
+from .validation import prepare_drone_log, prepare_image_tracks
 
 
 def convert_pixel_to_world(
@@ -80,7 +81,14 @@ def convert_pixel_to_world(
         - Input velocities: NED (North-East-Down) from drone IMU
         - Processing: ENU (East-North-Up) with origin at first GPS position
         - Output: ENU coordinates in meters relative to reference GPS point
+
+    Raises:
+        DataLoadError: If a table lacks required columns, the drone log has
+            non-numeric values in them, or velocity values are missing
     """
+
+    image_tracks_df = prepare_image_tracks(image_tracks_df)
+    sensor_data_df = prepare_drone_log(sensor_data_df)
 
     # ============================================================
     # SECTION 1: Process drone sensor data
@@ -314,7 +322,13 @@ def build_frame_homographies(
         - Input velocities: NED (North-East-Down) from drone IMU
         - Processing: ENU (East-North-Up) with origin at first GPS position
         - Output: ENU coordinates in meters relative to reference GPS point
+
+    Raises:
+        DataLoadError: If a table lacks required columns, the drone log has
+            non-numeric values in them, or velocity values are missing
     """
+
+    sensor_data_df = prepare_drone_log(sensor_data_df)
 
     # ============================================================
     # SECTION 1: Process drone sensor data
